@@ -1,7 +1,6 @@
 # Core dependencies
-# CRITICAL: Install fixed pyarcade from GitHub, NOT from PyPI
-# The PyPI version has bugs - use this command:
-# uv pip install git+https://github.com/ExtReMLapin/pyarcade.git
+# ArcadeDB Python client (now available on PyPI)
+arcadedb-python>=0.2.0
 
 # LlamaIndex core components
 llama-index-core>=0.10.0

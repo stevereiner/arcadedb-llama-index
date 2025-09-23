@@ -47,7 +47,7 @@ bin/server.sh -Darcadedb.server.rootPassword=playwithdata
 ### 2. Install Python Dependencies
 
 ```bash
-# Install from PyPI (coming soon)
+# Install from PyPI
 pip install llama-index-graph-stores-arcadedb
 
 # Or install from source
@@ -254,7 +254,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 - [ArcadeDB](https://arcadedb.com/) - Multi-model database
 - [LlamaIndex Framework](https://developers.llamaindex.ai/python/framework/) - Framework for building LLM applications
-- [arcadedb-python](https://github.com/your-org/arcadedb-python) - Python client for ArcadeDB (available on PyPI and GitHub)
+- [arcadedb-python](https://pypi.org/project/arcadedb-python/) - Python client for ArcadeDB (available on PyPI)
 
 ## Support
 
