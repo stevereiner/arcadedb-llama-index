@@ -1,0 +1,15 @@
+LONDON – September 10, 2008 – Alfresco Software today announced the availability of the first Content Management Interoperability Services (CMIS) specification draft implementation. As a contributing member of the draft technical specification, Alfresco is able to offer a draft implementation of CMIS for developers who wish to explore the draft specification.
+
+Just as the major database vendors standardized on SQL in the 1980’s, today’s leading ECM vendors have developed a draft specification with the goal of delivering and enabling interoperability across content repositories.  The draft specification is backed by Alfresco, EMC, IBM, Microsoft, OpenText, Oracle and SAP.
+
+Today most companies have multiple content management systems supporting individual applications resulting in islands of incompatible systems. Organizations are searching for a write-once, run-anywhere content application that will both run against, and integrate content from multiple content management systems into a Portal, CRM system or Office application.
+
+The objective of the draft CMIS specification is to deliver a common, REST or Web Services, API that can be used to develop write-once, run-anywhere, next generation content and social applications. Following the announcement earlier today of the planned submission of the CMIS specification to OASIS (Organization for the Advancement of Structured Information Standards), Alfresco has made available the following for preview:
+
+    * Support for the CMIS REST and Web Services bindings allowing client applications to connect to, navigate, read, and create content against the Alfresco content repository
+    * Support for the CMIS Query Language providing SQL-like querying of the repository including location, properties, and full-text
+    * A CMIS Test Suite to allow compliance compatibility testing against any CMIS compliant REST Binding
+
+In order to drive the ongoing development and discussion of the draft technical specification, Alfresco will shortly make available CMIS webinars and tutorials.
+
+“CMIS will ultimately become the foundation for developing next generation content collaboration and social computing applications,” said John Newton, Chairman and CTO, Alfresco Software.  “Developers can start exploring CMIS today with the draft implementation available from Alfresco Labs. CMIS will enable anyone to develop content applications on open source Alfresco and deploy them on SharePoint, EMC, IBM, or OpenText.” 

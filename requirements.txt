@@ -1,0 +1,20 @@
+# Core dependencies
+# CRITICAL: Install fixed pyarcade from GitHub, NOT from PyPI
+# The PyPI version has bugs - use this command:
+# uv pip install git+https://github.com/ExtReMLapin/pyarcade.git
+
+# LlamaIndex core components
+llama-index-core>=0.10.0
+
+# Optional: LlamaIndex integrations for examples
+llama-index-embeddings-openai
+llama-index-llms-openai
+
+# Development dependencies (install with: uv pip install -e ".[dev]")
+# black>=23.0.0
+# mypy>=1.0.0
+# pre-commit>=3.0.0
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+# pytest-cov>=4.0.0
+# ruff>=0.1.0

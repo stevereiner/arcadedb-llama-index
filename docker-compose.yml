@@ -1,0 +1,29 @@
+services:
+  arcadedb:
+    image: arcadedata/arcadedb:latest  # Use latest version instead of 23.11.1
+    container_name: arcadedb-server
+    ports:
+      - "2480:2480"  # HTTP API
+      - "2424:2424"  # Binary protocol
+    environment:
+      - JAVA_OPTS=-Darcadedb.server.rootPassword=playwithdata -Darcadedb.server.mode=development
+    volumes:
+      - arcadedb_data:/home/arcadedb/databases
+    stdin_open: true
+    tty: true
+    healthcheck:
+      # Use 127.0.0.1 instead of localhost for better Docker compatibility
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:2480/api/v1/server || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  arcadedb_data:
+    driver: local
+
+networks:
+  default:
+    name: arcadedb-network
