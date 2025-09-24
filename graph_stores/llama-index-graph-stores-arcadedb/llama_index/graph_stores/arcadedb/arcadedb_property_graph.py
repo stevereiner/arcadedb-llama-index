@@ -34,13 +34,19 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
-    # Import from the arcadedb_python package
     from arcadedb_python.api.sync import SyncClient
     from arcadedb_python.dao.database import DatabaseDao
+    from arcadedb_python import (
+        ArcadeDBException,
+        QueryParsingException,
+        ValidationException,
+        BulkOperationException,
+        TransactionException,
+    )
 except ImportError as e:
     raise ImportError(
-        "arcadedb_python is required for ArcadeDB integration. "
-        "Install it with: pip install arcadedb-python"
+        "arcadedb_python>=0.3.0 is required for ArcadeDB integration. "
+        "Install it with: pip install arcadedb-python>=0.3.0"
     ) from e
 
 from llama_index.core.graph_stores.types import (
@@ -250,7 +256,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         logger.error(f"Schema creation failed: CREATE {type_kind} TYPE {type_name} - {e}")
                         # Don't continue if critical types fail with non-idempotent errors
                         if type_name in ['Entity', 'TextChunk']:
-                            raise Exception(f"Critical type creation failed: {type_name}")
+                            raise ValidationException(f"Critical type creation failed: {type_name}")
 
             # Verify the schema was created
             try:
@@ -544,112 +550,149 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[Triplet]:
-        """Get triplets (relationships) with matching criteria."""
+        """Get triplets (relationships) with matching criteria using v0.3.0+ features."""
         triplets = []
 
         try:
-                # Use SQL MATCH for more intuitive Cypher-style graph pattern matching
-                try:
-                    match_conditions = []
-                    where_conditions = []
+            # Try enhanced get_triplets method first
+            try:
+                logger.debug("Using enhanced get_triplets method")
+                
+                # Use enhanced get_triplets method with correct parameters
+                enhanced_results = self._db.get_triplets(
+                    subject_types=entity_names,
+                    relation_types=relation_names,
+                    object_types=entity_names,  # Use same entity names for objects
+                    limit=10000
+                )
+                
+                # Convert enhanced results to Triplet objects
+                for result in enhanced_results:
+                    if isinstance(result, dict):
+                        source_id = result.get('source', {}).get('id') or result.get('subject', {}).get('id')
+                        target_id = result.get('target', {}).get('id') or result.get('object', {}).get('id')
+                        relation_type = result.get('relation', {}).get('type') or result.get('predicate')
+                        
+                        if source_id and target_id and relation_type:
+                            triplet = Triplet(
+                                subject_id=source_id,
+                                object_id=target_id,
+                                label=relation_type
+                            )
+                            triplets.append(triplet)
+                
+                logger.debug(f"Enhanced get_triplets returned {len(triplets)} triplets")
+                return triplets
+                
+            except (QueryParsingException, ArcadeDBException) as e:
+                logger.warning(f"Enhanced get_triplets failed, using fallback: {e}")
+                # Fall through to traditional method
+                
+            # Traditional method (fallback)
+            logger.debug("Using traditional get_triplets method")
+            
+            # Use SQL MATCH for more intuitive Cypher-style graph pattern matching
+            try:
+                match_conditions = []
+                where_conditions = []
 
-                    # Build entity name conditions if specified
-                    if entity_names:
-                        escaped_names = [self._escape_string(name) for name in entity_names]
-                        entity_conditions = []
-                        for name in escaped_names:
-                            # Handle both TextChunk (id field) and Entity (name field) matching
-                            entity_conditions.extend([
-                                f"a.name = '{name}'",
-                                f"b.name = '{name}'",
-                                f"a.id = '{name}'",
-                                f"b.id = '{name}'"
-                            ])
-                        where_conditions.append(f"({' OR '.join(entity_conditions)})")
+                # Build entity name conditions if specified
+                if entity_names:
+                    escaped_names = [self._escape_string(name) for name in entity_names]
+                    entity_conditions = []
+                    for name in escaped_names:
+                        # Handle both TextChunk (id field) and Entity (name field) matching
+                        entity_conditions.extend([
+                            f"a.name = '{name}'",
+                            f"b.name = '{name}'",
+                            f"a.id = '{name}'",
+                            f"b.id = '{name}'"
+                        ])
+                    where_conditions.append(f"({' OR '.join(entity_conditions)})")
 
-                    # Build relation name conditions if specified
-                    if relation_names:
-                        escaped_relations = [self._escape_string(name) for name in relation_names]
-                        relation_conditions = [f"r.@class = '{rel}'" for rel in escaped_relations]
-                        where_conditions.append(f"({' OR '.join(relation_conditions)})")
+                # Build relation name conditions if specified
+                if relation_names:
+                    escaped_relations = [self._escape_string(name) for name in relation_names]
+                    relation_conditions = [f"r.@class = '{rel}'" for rel in escaped_relations]
+                    where_conditions.append(f"({' OR '.join(relation_conditions)})")
 
-                    # Build property conditions if specified
-                    if properties:
-                        for key, value in properties.items():
-                            if isinstance(value, str):
-                                escaped_value = self._escape_string(value)
-                                where_conditions.append(f"(a.{key} = '{escaped_value}' OR b.{key} = '{escaped_value}' OR r.{key} = '{escaped_value}')")
-                            else:
-                                where_conditions.append(f"(a.{key} = {value} OR b.{key} = {value} OR r.{key} = {value})")
+                # Build property conditions if specified
+                if properties:
+                    for key, value in properties.items():
+                        if isinstance(value, str):
+                            escaped_value = self._escape_string(value)
+                            where_conditions.append(f"(a.{key} = '{escaped_value}' OR b.{key} = '{escaped_value}' OR r.{key} = '{escaped_value}')")
+                        else:
+                            where_conditions.append(f"(a.{key} = {value} OR b.{key} = {value} OR r.{key} = {value})")
 
-                    # Build ID conditions if specified
-                    if ids:
-                        escaped_ids = [self._escape_string(node_id) for node_id in ids]
-                        id_conditions = []
-                        for node_id in escaped_ids:
-                            id_conditions.extend([
-                                f"a.id = '{node_id}'",
-                                f"b.id = '{node_id}'",
-                                f"a.name = '{node_id}'",
-                                f"b.name = '{node_id}'"
-                            ])
-                        where_conditions.append(f"({' OR '.join(id_conditions)})")
+                # Build ID conditions if specified
+                if ids:
+                    escaped_ids = [self._escape_string(node_id) for node_id in ids]
+                    id_conditions = []
+                    for node_id in escaped_ids:
+                        id_conditions.extend([
+                            f"a.id = '{node_id}'",
+                            f"b.id = '{node_id}'",
+                            f"a.name = '{node_id}'",
+                            f"b.name = '{node_id}'"
+                        ])
+                    where_conditions.append(f"({' OR '.join(id_conditions)})")
 
-                    # Build SQL MATCH query for relationship pattern
-                    where_clause = " AND ".join(where_conditions) if where_conditions else ""
-                    
-                    if where_clause:
-                        query = f"""
-                        MATCH {{as: a}}-{{as: r}}-{{as: b}}
-                        WHERE {where_clause}
-                        RETURN a, r, b
-                        LIMIT 100
-                        """
-                    else:
-                        query = """
-                        MATCH {as: a}-{as: r}-{as: b}
-                        RETURN a, r, b
-                        LIMIT 100
-                        """
+                # Build SQL MATCH query for relationship pattern
+                where_clause = " AND ".join(where_conditions) if where_conditions else ""
+                
+                if where_clause:
+                    query = f"""
+                    MATCH {{as: a}}-{{as: r}}-{{as: b}}
+                    WHERE {where_clause}
+                    RETURN a, r, b
+                    LIMIT 100
+                    """
+                else:
+                    query = """
+                    MATCH {as: a}-{as: r}-{as: b}
+                    RETURN a, r, b
+                    LIMIT 100
+                    """
 
-                    logger.debug(f"Executing SQL MATCH triplets query")
-                    results = self._db.query("sql", query)
-                    
-                    # Process SQL MATCH results
-                    for result in results:
-                        try:
-                            source_node = self._result_to_node(result.get('a', {}))
-                            target_node = self._result_to_node(result.get('b', {}))
-                            relationship = self._result_to_relation(result.get('r', {}))
-                            triplets.append((source_node, relationship, target_node))
-                        except Exception as parse_error:
-                            logger.debug(f"Failed to parse triplet result: {parse_error}")
-                            continue
-                    
-                    logger.info(f"SQL_MATCH_TRIPLETS: Found {len(triplets)} triplets using MATCH pattern")
-                    
-                except Exception as match_error:
-                    logger.warning(f"SQL MATCH triplets failed, falling back to expand(both()): {match_error}")
-                    
-                    # Fallback to original expand(both()) approach
-                    query_parts = ["SELECT expand(both()) FROM RELATION"]
-                    where_conditions = []
+                logger.debug(f"Executing SQL MATCH triplets query")
+                results = self._db.query("sql", query)
+                
+                # Process SQL MATCH results
+                for result in results:
+                    try:
+                        source_node = self._result_to_node(result.get('a', {}))
+                        target_node = self._result_to_node(result.get('b', {}))
+                        relationship = self._result_to_relation(result.get('r', {}))
+                        triplets.append((source_node, relationship, target_node))
+                    except Exception as parse_error:
+                        logger.debug(f"Failed to parse triplet result: {parse_error}")
+                        continue
+                
+                logger.info(f"SQL_MATCH_TRIPLETS: Found {len(triplets)} triplets using MATCH pattern")
+                
+            except Exception as match_error:
+                logger.warning(f"SQL MATCH triplets failed, falling back to expand(both()): {match_error}")
+                
+                # Fallback to original expand(both()) approach
+                query_parts = ["SELECT expand(both()) FROM RELATION"]
+                where_conditions = []
 
-                    if entity_names:
-                        entity_names_str = "', '".join(entity_names)
-                        where_conditions.append(f"(in().name IN ['{entity_names_str}'] OR out().name IN ['{entity_names_str}'])")
+                if entity_names:
+                    entity_names_str = "', '".join(entity_names)
+                    where_conditions.append(f"(in().name IN ['{entity_names_str}'] OR out().name IN ['{entity_names_str}'])")
 
-                    if relation_names:
-                        relation_names_str = "', '".join(relation_names)
-                        where_conditions.append(f"@class IN ['{relation_names_str}']")
+                if relation_names:
+                    relation_names_str = "', '".join(relation_names)
+                    where_conditions.append(f"@class IN ['{relation_names_str}']")
 
-                    if where_conditions:
-                        query_parts.append("WHERE " + " AND ".join(where_conditions))
+                if where_conditions:
+                    query_parts.append("WHERE " + " AND ".join(where_conditions))
 
-                    query_parts.append("LIMIT 100")
-                    query = " ".join(query_parts)
-                    logger.debug(f"Executing fallback expand(both()) query")
-                    results = self._db.query("sql", query)
+                query_parts.append("LIMIT 100")
+                query = " ".join(query_parts)
+                logger.debug(f"Executing fallback expand(both()) query")
+                results = self._db.query("sql", query)
 
         except Exception as e:
             logger.error(f"Failed to get triplets: {e}")
@@ -762,7 +805,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         return triplets
 
     def upsert_nodes(self, nodes: Sequence[LabelledNode]) -> None:
-        """Insert or update nodes in the graph."""
+        """Insert or update nodes in the graph using v0.3.0+ bulk operations."""
         # Debug: Count node types being received
         entity_count = sum(1 for node in nodes if isinstance(node, EntityNode))
         chunk_count = sum(1 for node in nodes if isinstance(node, ChunkNode))
@@ -770,34 +813,153 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         
         logger.info(f"DEBUG: Upserting nodes: {entity_count} entities, {chunk_count} chunks, {other_count} other")
         
-        for node in nodes:
-            try:
-                if isinstance(node, EntityNode):
-                    logger.debug(f"ENTITY: Upserting EntityNode: {node.name} (label: {getattr(node, 'label', 'None')})")
-                    self._upsert_entity_node(node)
-                elif isinstance(node, ChunkNode):
-                    logger.debug(f"CHUNK: Upserting ChunkNode: {node.id}")
-                    self._upsert_chunk_node(node)
-                else:
+        # Try bulk operations first for better performance
+        try:
+            # Separate nodes by type for bulk operations
+            entity_nodes = [node for node in nodes if isinstance(node, EntityNode)]
+            chunk_nodes = [node for node in nodes if isinstance(node, ChunkNode)]
+            other_nodes = [node for node in nodes if not isinstance(node, (EntityNode, ChunkNode))]
+            
+            # Bulk upsert entity nodes
+            if entity_nodes:
+                try:
+                    entity_data = []
+                    for node in entity_nodes:
+                        data = {
+                            'name': node.name,
+                            'label': getattr(node, 'label', 'Entity'),
+                            'properties': node.properties or {}
+                        }
+                        if hasattr(node, 'embedding') and node.embedding:
+                            data['embedding'] = json.dumps(node.embedding)
+                        entity_data.append(data)
+                    
+                    upserted_count = self._db.bulk_upsert(
+                        type_name="Entity",
+                        records=entity_data,
+                        key_field='name',
+                        batch_size=100
+                    )
+                    logger.info(f"Bulk upserted {upserted_count} entity nodes")
+                    
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk entity upsert failed, using individual operations: {e}")
+                    # Fallback to individual operations
+                    for node in entity_nodes:
+                        try:
+                            self._upsert_entity_node(node)
+                        except Exception as e2:
+                            logger.error(f"Failed to upsert entity node {node.name}: {e2}")
+            
+            # Bulk upsert chunk nodes
+            if chunk_nodes:
+                try:
+                    chunk_data = []
+                    for node in chunk_nodes:
+                        data = {
+                            'id': node.id,
+                            'text': getattr(node, 'text', ''),
+                            'properties': node.properties or {}
+                        }
+                        if hasattr(node, 'embedding') and node.embedding:
+                            data['embedding'] = json.dumps(node.embedding)
+                        chunk_data.append(data)
+                    
+                    upserted_count = self._db.bulk_upsert(
+                        type_name="TextChunk",
+                        records=chunk_data,
+                        key_field='id',
+                        batch_size=100
+                    )
+                    logger.info(f"Bulk upserted {upserted_count} chunk nodes")
+                    
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk chunk upsert failed, using individual operations: {e}")
+                    # Fallback to individual operations
+                    for node in chunk_nodes:
+                        try:
+                            self._upsert_chunk_node(node)
+                        except Exception as e2:
+                            logger.error(f"Failed to upsert chunk node {node.id}: {e2}")
+            
+            # Handle other nodes individually (no bulk operation available)
+            for node in other_nodes:
+                try:
                     logger.debug(f"OTHER: Upserting generic node: {node.id} (type: {type(node)})")
                     self._upsert_generic_node(node)
-            except Exception as e:
-                logger.error(f"Failed to upsert node {getattr(node, 'id', getattr(node, 'name', 'unknown'))}: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                except Exception as e:
+                    logger.error(f"Failed to upsert generic node {getattr(node, 'id', 'unknown')}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Bulk upsert failed, falling back to individual operations: {e}")
+            # Complete fallback to individual operations
+            for node in nodes:
+                try:
+                    if isinstance(node, EntityNode):
+                        logger.debug(f"ENTITY: Upserting EntityNode: {node.name} (label: {getattr(node, 'label', 'None')})")
+                        self._upsert_entity_node(node)
+                    elif isinstance(node, ChunkNode):
+                        logger.debug(f"CHUNK: Upserting ChunkNode: {node.id}")
+                        self._upsert_chunk_node(node)
+                    else:
+                        logger.debug(f"OTHER: Upserting generic node: {node.id} (type: {type(node)})")
+                        self._upsert_generic_node(node)
+                except Exception as e:
+                    logger.error(f"Failed to upsert node {getattr(node, 'id', getattr(node, 'name', 'unknown'))}: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
 
     def upsert_relations(self, relations: List[Relation]) -> None:
-        """Insert or update relationships in the graph."""
+        """Insert or update relationships in the graph using v0.3.0+ bulk operations."""
         logger.info(f"RELATIONS: Upserting {len(relations)} relations")
         
-        for relation in relations:
-            try:
-                logger.debug(f"RELATION: Upserting relation: {relation.source_id} --[{relation.label}]--> {relation.target_id}")
-                self._upsert_relation(relation)
-            except Exception as e:
-                logger.error(f"Failed to upsert relation {relation.label} ({relation.source_id} -> {relation.target_id}): {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
+        # Try bulk operations first for better performance
+        try:
+            # Group relations by type for bulk operations
+            relations_by_type = {}
+            for relation in relations:
+                rel_type = relation.label
+                if rel_type not in relations_by_type:
+                    relations_by_type[rel_type] = []
+                relations_by_type[rel_type].append(relation)
+            
+            # Bulk upsert relations by type
+            for rel_type, type_relations in relations_by_type.items():
+                try:
+                    relation_data = []
+                    for relation in type_relations:
+                        data = {
+                            'source_id': relation.source_id,
+                            'target_id': relation.target_id,
+                            'properties': relation.properties or {}
+                        }
+                        relation_data.append(data)
+                    
+                    # Note: bulk_upsert_relations doesn't exist in v0.3.0, fall back to individual
+                    logger.info(f"Processing {len(type_relations)} relations of type {rel_type} individually")
+                    for relation in type_relations:
+                        self._upsert_relation(relation)
+                    
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk relation upsert failed for {rel_type}, using individual operations: {e}")
+                    # Fallback to individual operations for this type
+                    for relation in type_relations:
+                        try:
+                            self._upsert_relation(relation)
+                        except Exception as e2:
+                            logger.error(f"Failed to upsert relation {relation.label} ({relation.source_id} -> {relation.target_id}): {e2}")
+                            
+        except Exception as e:
+            logger.error(f"Bulk relation upsert failed, falling back to individual operations: {e}")
+            # Complete fallback to individual operations
+            for relation in relations:
+                try:
+                    logger.debug(f"RELATION: Upserting relation: {relation.source_id} --[{relation.label}]--> {relation.target_id}")
+                    self._upsert_relation(relation)
+                except Exception as e:
+                    logger.error(f"Failed to upsert relation {relation.label} ({relation.source_id} -> {relation.target_id}): {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
 
     def delete(
         self,
@@ -806,22 +968,58 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> None:
-        """Delete nodes and relationships matching criteria."""
+        """Delete nodes and relationships matching criteria using v0.3.0+ features."""
         try:
             if ids:
-                # Delete by IDs
-                ids_str = "', '".join(ids)
-                query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE @rid IN ['{ids_str}']"
-                self._db.query("sql", query)
+                # Use bulk delete for IDs
+                try:
+                    ids_str = "', '".join(ids)
+                    # Delete from Entity first
+                    entity_deleted = self._db.bulk_delete(
+                        type_name="Entity",
+                        conditions=[f"@rid IN ['{ids_str}']"],
+                        batch_size=1000
+                    )
+                    # Delete from TextChunk
+                    chunk_deleted = self._db.bulk_delete(
+                        type_name="TextChunk", 
+                        conditions=[f"@rid IN ['{ids_str}']"],
+                        batch_size=1000
+                    )
+                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by IDs")
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
+                    # Fallback to traditional method
+                    ids_str = "', '".join(ids)
+                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE @rid IN ['{ids_str}']"
+                    self._db.query("sql", query, is_command=True)
 
             elif entity_names:
-                # Delete by entity names
-                names_str = "', '".join(entity_names)
-                query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE name IN ['{names_str}']"
-                self._db.query("sql", query)
+                # Use bulk delete for entity names
+                try:
+                    names_str = "', '".join(entity_names)
+                    # Delete from Entity first  
+                    entity_deleted = self._db.bulk_delete(
+                        type_name="Entity",
+                        conditions=[f"name IN ['{names_str}']"],
+                        batch_size=1000
+                    )
+                    # Delete from TextChunk (using id field)
+                    chunk_deleted = self._db.bulk_delete(
+                        type_name="TextChunk",
+                        conditions=[f"id IN ['{names_str}']"],
+                        batch_size=1000
+                    )
+                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by entity names")
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
+                    # Fallback to traditional method
+                    names_str = "', '".join(entity_names)
+                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE name IN ['{names_str}']"
+                    self._db.query("sql", query, is_command=True)
 
             elif properties:
-                # Delete by properties
+                # Build property conditions for bulk delete
                 where_conditions = []
                 for key, value in properties.items():
                     if isinstance(value, str):
@@ -829,18 +1027,42 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     else:
                         where_conditions.append(f"{key} = {value}")
 
-                where_clause = " AND ".join(where_conditions)
-                query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE {where_clause}"
-                self._db.query("sql", query)
+                try:
+                    # Delete from Entity first
+                    entity_deleted = self._db.bulk_delete(
+                        type_name="Entity",
+                        conditions=where_conditions,
+                        batch_size=1000
+                    )
+                    # Delete from TextChunk
+                    chunk_deleted = self._db.bulk_delete(
+                        type_name="TextChunk",
+                        conditions=where_conditions,
+                        batch_size=1000
+                    )
+                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by properties")
+                except (BulkOperationException, ValidationException) as e:
+                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
+                    # Fallback to traditional method
+                    where_clause = " AND ".join(where_conditions)
+                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE {where_clause}"
+                    self._db.query("sql", query, is_command=True)
 
             if relation_names:
-                # Delete relationships by type
-                names_str = "', '".join(relation_names)
-                query = f"DELETE FROM RELATION WHERE @class IN ['{names_str}']"
-                self._db.query("sql", query)
+                # Use safe_delete_all for relation types
+                for relation_name in relation_names:
+                    try:
+                        deleted_count = self._db.safe_delete_all(relation_name, batch_size=1000)
+                        logger.info(f"Safe deleted {deleted_count} relations of type {relation_name}")
+                    except (ValidationException, BulkOperationException) as e:
+                        logger.warning(f"Safe delete failed for {relation_name}, using traditional method: {e}")
+                        # Fallback to traditional method
+                        query = f"DELETE FROM {relation_name}"
+                        self._db.query("sql", query, is_command=True)
 
         except Exception as e:
             logger.error(f"Failed to delete: {e}")
+            raise ArcadeDBException(f"Delete operation failed: {e}") from e
 
     def structured_query(
         self, query: str, param_map: Optional[Dict[str, Any]] = None
@@ -857,7 +1079,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         except Exception as e:
             logger.error(f"Structured query failed: {e}")
             logger.error(f"Query was: {query}")
-            return []
+            raise QueryParsingException(f"SQL query execution failed: {e}") from e
 
     def vector_query(
         self, query: VectorStoreQuery, **kwargs: Any
