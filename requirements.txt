@@ -1,6 +1,6 @@
 # Core dependencies
 # ArcadeDB Python client (now available on PyPI)
-arcadedb-python>=0.2.0
+arcadedb-python>=0.3.1
 
 # LlamaIndex core components
 llama-index-core>=0.10.0

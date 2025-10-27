@@ -5,14 +5,22 @@ Final test of ArcadeDB PropertyGraphStore with corrected CREATE PROPERTY and CRE
 
 import sys
 import tempfile
-sys.path.append('arcadedb-integration')
+import pytest
 
-from llama_index.graph_stores.arcadedb import ArcadeDBPropertyGraphStore
-from llama_index.core import SimpleDirectoryReader, PropertyGraphIndex
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
+try:
+    from llama_index.graph_stores.arcadedb import ArcadeDBPropertyGraphStore
+    from llama_index.core import SimpleDirectoryReader, PropertyGraphIndex
+    from llama_index.llms.openai import OpenAI
+    from llama_index.embeddings.openai import OpenAIEmbedding
+    DEPENDENCIES_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Import error: {e}")
+    DEPENDENCIES_AVAILABLE = False
 
 def test_final_integration():
+    if not DEPENDENCIES_AVAILABLE:
+        pytest.skip("Required dependencies not available (OpenAI, LlamaIndex components)")
+    
     print("🚀 Testing final ArcadeDB integration with corrected syntax...")
     
     # Initialize with corrected syntax
@@ -69,13 +77,13 @@ def test_final_integration():
         print(f"  - Database: final_test")
         print(f"  - Mode: SQL with native UPSERT")
         
-        return True
+        assert True  # Test passes
         
     except Exception as e:
         print(f"❌ ERROR: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        assert False, f"Integration test failed: {e}"
     
     finally:
         import os
