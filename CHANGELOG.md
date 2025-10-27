@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2025-10-26] - 0.3.1 release: use pythondb-python 0.3.1, updates to pass all tests, and not get some query errors
+## [2025-10-26] - 0.3.1 release: use arcadedb-python 0.3.1, updates to pass all tests, and not get some query errors
 
 ### Changed
 
