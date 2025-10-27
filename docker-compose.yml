@@ -1,6 +1,6 @@
 services:
   arcadedb:
-    image: arcadedata/arcadedb:latest  # Use latest version instead of 23.11.1
+    image: arcadedata/arcadedb:25.9.1  # Use stable release instead of snapshot
     container_name: arcadedb-server
     ports:
       - "2480:2480"  # HTTP API

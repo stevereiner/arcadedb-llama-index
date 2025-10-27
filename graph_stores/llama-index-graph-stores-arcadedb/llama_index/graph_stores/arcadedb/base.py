@@ -82,10 +82,9 @@ class ArcadeDBGraphStore(GraphStore):
     def _ensure_database(self, database_name: str) -> None:
         """Ensure the database exists."""
         try:
-            # Check if database exists
+            # Check if database exists using DatabaseDao.exists method
             from arcadedb_python.dao.database import DatabaseDao
-            databases = DatabaseDao.list_databases(self._client)
-            if database_name not in [db.get("name") for db in databases]:
+            if not DatabaseDao.exists(self._client, database_name):
                 # Create database
                 DatabaseDao.create(self._client, database_name)
                 logger.info(f"Created database: {database_name}")
@@ -151,8 +150,20 @@ class ArcadeDBGraphStore(GraphStore):
             logger.debug("Using traditional delete operations")
             try:
                 # Try individual DELETE operations
-                self._db.query("sql", "DELETE FROM E", is_command=True)
-                self._db.query("sql", "DELETE FROM V", is_command=True)
+                # Delete from all vertex types instead of non-existent E type
+                try:
+                    schema_query = "SELECT name FROM schema:types WHERE type = 'vertex'"
+                    vertex_type_results = self._db.query("sql", schema_query)
+                    if vertex_type_results and isinstance(vertex_type_results, list):
+                        for item in vertex_type_results:
+                            if isinstance(item, dict) and 'name' in item:
+                                vertex_type = item['name']
+                                try:
+                                    self._db.query("sql", f"DELETE FROM {vertex_type}", is_command=True)
+                                except Exception:
+                                    pass  # Ignore if deletion fails
+                except Exception:
+                    pass  # Ignore if schema query fails
                 logger.info("Traditional delete operations completed")
             except Exception as e:
                 logger.warning(f"Traditional delete operations failed: {e}")
@@ -167,29 +178,9 @@ class ArcadeDBGraphStore(GraphStore):
         try:
             logger.debug(f"Getting triplets for subject: {subj}")
             
-            # Try enhanced get_triplets method first
-            try:
-                logger.debug("Using get_triplets method")
-                results = self._db.get_triplets(
-                    subject_filter=subj,
-                    limit=1000
-                )
-                
-                # Convert to expected format
-                triplets = []
-                for result in results:
-                    if isinstance(result, dict):
-                        subject = result.get('subject', {}).get('id', subj)
-                        relation = result.get('relation', {}).get('type', 'UNKNOWN')
-                        obj = result.get('object', {}).get('id', 'UNKNOWN')
-                        triplets.append([subject, relation, obj])
-                
-                logger.debug(f"get_triplets returned {len(triplets)} triplets")
-                return triplets
-                
-            except (QueryParsingException, ArcadeDBException) as e:
-                logger.warning(f"get_triplets failed, using fallback: {e}")
-                # Fall through to traditional method
+            # Skip enhanced get_triplets method as it tries to query non-existent E type
+            # Fall through directly to traditional method
+            logger.debug("Skipping enhanced get_triplets method due to E type issue")
             
             # Traditional method (fallback)
             logger.debug("Using traditional triplet retrieval method")

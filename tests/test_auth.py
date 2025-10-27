@@ -5,17 +5,25 @@ Test different authentication combinations for ArcadeDB.
 
 import requests
 import json
+import pytest
 
 def test_auth_combinations():
     """Test different username/password combinations."""
     
     print("🔧 Testing ArcadeDB authentication...")
     
-    # Common username/password combinations to try
+    # First check if ArcadeDB is available
+    try:
+        response = requests.get("http://localhost:2480", timeout=2)
+    except Exception:
+        pytest.skip("ArcadeDB server not available at localhost:2480")
+    
+    # Try the correct credentials first, then fallbacks
     auth_combinations = [
-        ("root", "playingwithdata"),
-        ("admin", "playingwithdata"), 
-        ("arcadedb", "playingwithdata"),
+        ("root", "playwithdata"),  # Correct credentials first
+        ("root", "playingwithdata"),  # Common typo
+        ("admin", "playwithdata"), 
+        ("arcadedb", "playwithdata"),
         ("root", "admin"),
         ("admin", "admin"),
         ("root", ""),
@@ -42,7 +50,8 @@ def test_auth_combinations():
                 print(f"✅ SUCCESS with {username}/{password}")
                 result = response.json()
                 print(f"   Result: {result}")
-                return username, password
+                assert True  # Test passes if we find valid auth
+                return
             else:
                 print(f"❌ Failed: {response.status_code} - {response.text[:100]}")
                 
@@ -50,7 +59,7 @@ def test_auth_combinations():
             print(f"❌ Error with {username}/{password}: {e}")
     
     print("\n❌ No valid authentication found!")
-    return None, None
+    assert False, "No valid authentication found"
 
 if __name__ == "__main__":
     test_auth_combinations()

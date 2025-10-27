@@ -1,58 +1,33 @@
 import time
 import unittest
-import docker
 from llama_index.core.graph_stores.types import GraphStore
 from llama_index.graph_stores.arcadedb import ArcadeDBGraphStore
-
-# Set up Docker client
-docker_client = docker.from_env()
 
 
 class TestArcadeDBGraphStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Setup method called once for the entire test class."""
-        # Clean up any existing test containers
-        try:
-            existing = docker_client.containers.get("arcadedb_test_instance")
-            existing.stop()
-            existing.remove()
-        except:
-            pass  # Container doesn't exist
+        # Reuse existing ArcadeDB server from docker-compose but use different database
+        # This avoids port conflicts and is more efficient
         
-        # Start ArcadeDB container
-        try:
-            cls.container = docker_client.containers.run(
-                "arcadedata/arcadedb:latest",
-                detach=True,
-                name="arcadedb_test_instance",
-                ports={"2480/tcp": 2480, "2424/tcp": 2424},
-                environment={
-                    "JAVA_OPTS": "-Darcadedb.server.rootPassword=playwithdata"
-                }
-            )
-            time.sleep(15)  # Allow time for ArcadeDB to initialize
-        except Exception as e:
-            print(f"Error starting ArcadeDB container: {e}")
-            raise
-
-        # Set up the graph store - database creation should now work
+        # Set up the graph store using existing server with unique database name
         cls.graph_store = ArcadeDBGraphStore(
             host="localhost",
-            port=2480,
+            port=2480,  # Use existing docker-compose port
             username="root",
             password="playwithdata",
-            database="graph"
+            database=f"graph_test_{int(time.time())}"  # Unique database name
         )
 
     @classmethod
     def tearDownClass(cls):
         """Teardown method called once after all tests are done."""
+        # Clean up the test database
         try:
-            cls.container.stop()
-            cls.container.remove()
+            cls.graph_store.clear_database()
         except Exception as e:
-            print(f"Error stopping/removing container: {e}")
+            print(f"Error cleaning up test database: {e}")
 
     def setUp(self):
         """Clear database before each test."""

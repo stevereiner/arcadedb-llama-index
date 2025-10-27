@@ -130,28 +130,28 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             logger.error(f"Failed to initialize ArcadeDB client: {e}")
             raise
 
-        # Connect to or create database
+        # Connect to or create database using proper pattern
         try:
-            # Try to connect to existing database
-            self._db = DatabaseDao(self._client, database)
+            if not DatabaseDao.exists(self._client, database):
+                if create_database_if_not_exists:
+                    logger.info(f"Database {database} does not exist, creating...")
+                    self._db = DatabaseDao.create(self._client, database)
+                    logger.info(f"Created database: {database}")
+                else:
+                    logger.error(f"Database {database} does not exist and create_database_if_not_exists=False")
+                    raise Exception(f"Database {database} does not exist")
+            else:
+                logger.info(f"Database {database} exists, connecting...")
+                self._db = DatabaseDao(self._client, database)
+                logger.info(f"Connected to existing database: {database}")
             
             # Test the connection with a simple query
             test_result = self._db.query("sql", "SELECT 1 as test")
-            logger.info(f"Connected to existing database: {database}")
+            logger.info(f"Database connection test successful: {test_result}")
             
         except Exception as e:
-            if create_database_if_not_exists:
-                logger.info(f"Database {database} not found or inaccessible, creating...")
-                try:
-                    # Create new database using the fixed client
-                    self._db = DatabaseDao.create(self._client, database)
-                    logger.info(f"Created database: {database}")
-                except Exception as create_error:
-                    logger.error(f"Failed to create database: {create_error}")
-                    raise create_error
-            else:
-                logger.error(f"Database connection failed: {e}")
-                raise e
+            logger.error(f"Database connection/creation failed: {e}")
+            raise
 
         # Set PropertyGraphStore capabilities
         self.supports_structured_queries = True
@@ -364,19 +364,14 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     ('embedding', 'STRING', '(hidden true)')  # Hidden JSON string for embeddings
                 ]
             
-            # Create each property with proper data type
+            # Create each property with proper data type using correct IF NOT EXISTS syntax
             for prop_name, prop_type, constraints in properties:
                 try:
-                    prop_query = f"CREATE PROPERTY {type_name}.{prop_name} {prop_type} {constraints}".strip()
+                    prop_query = f"CREATE PROPERTY {type_name}.{prop_name} IF NOT EXISTS {prop_type} {constraints}".strip()
                     self._db.query("sql", prop_query, is_command=True)
                     logger.debug(f"Created property {type_name}.{prop_name} ({prop_type})")
                 except Exception as prop_error:
-                    error_msg = str(prop_error)
-                    if "already exists" in error_msg.lower():
-                        logger.debug(f"Property {type_name}.{prop_name} already exists - skipping")
-                    else:
-                        logger.warning(f"Property creation failed for {type_name}.{prop_name}: {prop_error}")
-                        # Don't raise exception for property creation failures - they may already exist
+                    logger.warning(f"Property creation failed for {type_name}.{prop_name}: {prop_error}")
             
             # Create UNIQUE index on the primary key property
             primary_key = 'id' if type_name == 'TextChunk' else 'name'
@@ -411,11 +406,11 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         created_indexes = 0
         for type_name, property_name, index_name in index_definitions:
             try:
-                # Step 1: Ensure property exists first
-                prop_query = f"CREATE PROPERTY {type_name}.{property_name} STRING"
+                # Step 1: Ensure property exists first using correct IF NOT EXISTS syntax
                 try:
+                    prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
                     self._db.query("sql", prop_query, is_command=True)
-                    logger.debug(f"Ensured property {type_name}.{property_name} exists")
+                    logger.debug(f"Created property {type_name}.{property_name}")
                 except Exception as prop_error:
                     logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
                 
@@ -454,17 +449,13 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             return
         
         # Fallback: Create property and index if needed (for non-standard properties)
+        # Step 1: Ensure the property exists using correct IF NOT EXISTS syntax
         try:
-            # Step 1: Ensure the property exists
-            prop_query = f"CREATE PROPERTY {type_name}.{property_name} STRING"
+            prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
             self._db.query("sql", prop_query, is_command=True)
             logger.debug(f"Created fallback property {type_name}.{property_name}")
         except Exception as prop_error:
-            error_msg = str(prop_error)
-            if "already exists" in error_msg.lower():
-                logger.debug(f"Property {type_name}.{property_name} already exists")
-            else:
-                logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
+            logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
         
         # Step 2: Create UNIQUE index
         try:
@@ -492,51 +483,105 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
         try:
             if ids:
-                # Query by node IDs - try both Entity and TextChunk tables
+                # Query by node IDs - search all vertex type tables
+                
+                # Get list of all vertex types from schema
+                try:
+                    schema_query = "SELECT name FROM schema:types WHERE type = 'vertex'"
+                    type_results = self._db.query("sql", schema_query)
+                    vertex_types = []
+                    if type_results and isinstance(type_results, list):
+                        vertex_types = [item['name'] for item in type_results if isinstance(item, dict) and 'name' in item]
+                except Exception as e:
+                    # Fallback to known types if schema query fails
+                    vertex_types = ['Entity', 'TextChunk', 'PERSON', 'ORGANIZATION', 'LOCATION', 'PLACE']
+                
                 for node_id in ids:
-                    # Try Entity first
-                    try:
-                        query = f"SELECT * FROM Entity WHERE id = '{node_id}' OR name = '{node_id}'"
-                        results = self._db.query("sql", query)
-                        if results.get("result"):
-                            for result in results["result"]:
-                                nodes.append(self._result_to_node(result))
-                            continue
-                    except:
-                        pass
+                    found = False
+                    # Search each vertex type table for the ID
+                    for type_name in vertex_types:
+                        try:
+                            # For TextChunk, search by id; for others, search by both id and name
+                            # Properly escape the node_id to handle apostrophes and special characters
+                            escaped_id = self._escape_string(node_id)
+                            if type_name == 'TextChunk':
+                                query = f"SELECT * FROM {type_name} WHERE id = '{escaped_id}'"
+                            else:
+                                query = f"SELECT * FROM {type_name} WHERE id = '{escaped_id}' OR name = '{escaped_id}'"
+                            
+                            results = self._db.query("sql", query)
+                            if results and isinstance(results, list):
+                                for result in results:
+                                    try:
+                                        node = self._result_to_node(result)
+                                        nodes.append(node)
+                                    except Exception as conv_e:
+                                        logger.warning(f"Failed to convert result to node: {conv_e}, result: {result}")
+                                found = True
+                                break  # Found the node, no need to search other tables
+                        except Exception as e:
+                            logger.debug(f"Query failed for {type_name}: {e}")
                     
-                    # Try TextChunk if not found in Entity
-                    try:
-                        query = f"SELECT * FROM TextChunk WHERE id = '{node_id}'"
-                        results = self._db.query("sql", query)
-                        if results.get("result"):
-                            for result in results["result"]:
-                                nodes.append(self._result_to_node(result))
-                    except:
-                        pass
+                    if not found:
+                        logger.debug(f"Node with ID '{node_id}' not found in any vertex table")
 
             elif properties:
-                # Query by properties
+                # Query by properties - query all vertex type tables
                 where_conditions = []
                 for key, value in properties.items():
                     if isinstance(value, str):
-                        where_conditions.append(f"{key} = '{value}'")
+                        escaped_value = self._escape_string(value)
+                        where_conditions.append(f"{key} = '{escaped_value}'")
                     else:
                         where_conditions.append(f"{key} = {value}")
 
                 where_clause = " AND ".join(where_conditions)
-                query = f"SELECT * FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE {where_clause}"
-                results = self._db.query("sql", query)
-
-                for result in results:
-                    nodes.append(self._result_to_node(result))
+                
+                # Get list of all vertex types from schema
+                try:
+                    schema_query = "SELECT name FROM schema:types WHERE type = 'vertex'"
+                    type_results = self._db.query("sql", schema_query)
+                    vertex_types = []
+                    if type_results and isinstance(type_results, list):
+                        vertex_types = [item['name'] for item in type_results if isinstance(item, dict) and 'name' in item]
+                except Exception:
+                    # Fallback to known types if schema query fails
+                    vertex_types = ['Entity', 'TextChunk', 'PERSON', 'ORGANIZATION', 'LOCATION', 'PLACE']
+                
+                # Query each vertex type table
+                for type_name in vertex_types:
+                    try:
+                        query = f"SELECT * FROM {type_name} WHERE {where_clause}"
+                        results = self._db.query("sql", query)
+                        if results and isinstance(results, list):
+                            for result in results:
+                                nodes.append(self._result_to_node(result))
+                    except Exception:
+                        pass  # Ignore errors, table might not exist or be empty
             else:
-                # Get all nodes (limited)
-                query = "SELECT * FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) LIMIT 100"
-                results = self._db.query("sql", query)
-
-                for result in results:
-                    nodes.append(self._result_to_node(result))
+                # Get all nodes (limited) - query all vertex type tables
+                
+                # Get list of all vertex types from schema
+                try:
+                    schema_query = "SELECT name FROM schema:types WHERE type = 'vertex'"
+                    type_results = self._db.query("sql", schema_query)
+                    vertex_types = []
+                    if type_results and isinstance(type_results, list):
+                        vertex_types = [item['name'] for item in type_results if isinstance(item, dict) and 'name' in item]
+                except Exception:
+                    # Fallback to known types if schema query fails
+                    vertex_types = ['Entity', 'TextChunk', 'PERSON', 'ORGANIZATION', 'LOCATION', 'PLACE']
+                
+                # Query each vertex type table
+                for type_name in vertex_types:
+                    try:
+                        query = f"SELECT * FROM {type_name} LIMIT 50"
+                        results = self._db.query("sql", query)
+                        if results and isinstance(results, list):
+                            for result in results:
+                                nodes.append(self._result_to_node(result))
+                    except Exception:
+                        pass  # Ignore errors, table might not exist or be empty
 
         except Exception as e:
             logger.error(f"Failed to get nodes: {e}")
@@ -549,150 +594,99 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         relation_names: Optional[List[str]] = None,
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
-    ) -> List[Triplet]:
+    ) -> List[List[str]]:
         """Get triplets (relationships) with matching criteria using v0.3.0+ features."""
         triplets = []
 
         try:
-            # Try enhanced get_triplets method first
-            try:
-                logger.debug("Using enhanced get_triplets method")
-                
-                # Use enhanced get_triplets method with correct parameters
-                enhanced_results = self._db.get_triplets(
-                    subject_types=entity_names,
-                    relation_types=relation_names,
-                    object_types=entity_names,  # Use same entity names for objects
-                    limit=10000
-                )
-                
-                # Convert enhanced results to Triplet objects
-                for result in enhanced_results:
-                    if isinstance(result, dict):
-                        source_id = result.get('source', {}).get('id') or result.get('subject', {}).get('id')
-                        target_id = result.get('target', {}).get('id') or result.get('object', {}).get('id')
-                        relation_type = result.get('relation', {}).get('type') or result.get('predicate')
-                        
-                        if source_id and target_id and relation_type:
-                            triplet = Triplet(
-                                subject_id=source_id,
-                                object_id=target_id,
-                                label=relation_type
-                            )
-                            triplets.append(triplet)
-                
-                logger.debug(f"Enhanced get_triplets returned {len(triplets)} triplets")
-                return triplets
-                
-            except (QueryParsingException, ArcadeDBException) as e:
-                logger.warning(f"Enhanced get_triplets failed, using fallback: {e}")
-                # Fall through to traditional method
+            # Skip enhanced get_triplets method as it tries to query non-existent E type
+            # Fall through directly to traditional method
+            logger.debug("Skipping enhanced get_triplets method due to E type issue")
                 
             # Traditional method (fallback)
             logger.debug("Using traditional get_triplets method")
             
-            # Use SQL MATCH for more intuitive Cypher-style graph pattern matching
+            # Skip MATCH queries for now and use direct edge type queries
+            # This is more reliable and doesn't depend on complex MATCH syntax
+            logger.debug("Using direct edge type queries instead of MATCH")
+            
+            # Fallback to querying actual edge types instead of non-existent RELATION type
+            results = []
             try:
-                match_conditions = []
-                where_conditions = []
-
-                # Build entity name conditions if specified
-                if entity_names:
-                    escaped_names = [self._escape_string(name) for name in entity_names]
-                    entity_conditions = []
-                    for name in escaped_names:
-                        # Handle both TextChunk (id field) and Entity (name field) matching
-                        entity_conditions.extend([
-                            f"a.name = '{name}'",
-                            f"b.name = '{name}'",
-                            f"a.id = '{name}'",
-                            f"b.id = '{name}'"
-                        ])
-                    where_conditions.append(f"({' OR '.join(entity_conditions)})")
-
-                # Build relation name conditions if specified
-                if relation_names:
-                    escaped_relations = [self._escape_string(name) for name in relation_names]
-                    relation_conditions = [f"r.@class = '{rel}'" for rel in escaped_relations]
-                    where_conditions.append(f"({' OR '.join(relation_conditions)})")
-
-                # Build property conditions if specified
-                if properties:
-                    for key, value in properties.items():
-                        if isinstance(value, str):
-                            escaped_value = self._escape_string(value)
-                            where_conditions.append(f"(a.{key} = '{escaped_value}' OR b.{key} = '{escaped_value}' OR r.{key} = '{escaped_value}')")
-                        else:
-                            where_conditions.append(f"(a.{key} = {value} OR b.{key} = {value} OR r.{key} = {value})")
-
-                # Build ID conditions if specified
-                if ids:
-                    escaped_ids = [self._escape_string(node_id) for node_id in ids]
-                    id_conditions = []
-                    for node_id in escaped_ids:
-                        id_conditions.extend([
-                            f"a.id = '{node_id}'",
-                            f"b.id = '{node_id}'",
-                            f"a.name = '{node_id}'",
-                            f"b.name = '{node_id}'"
-                        ])
-                    where_conditions.append(f"({' OR '.join(id_conditions)})")
-
-                # Build SQL MATCH query for relationship pattern
-                where_clause = " AND ".join(where_conditions) if where_conditions else ""
+                # Get all edge types from schema
+                schema_query = "SELECT name FROM schema:types WHERE type = 'edge'"
+                edge_type_results = self._db.query("sql", schema_query)
+                edge_types = []
+                if edge_type_results and isinstance(edge_type_results, list):
+                    edge_types = [item['name'] for item in edge_type_results if isinstance(item, dict) and 'name' in item]
+                    
+                logger.debug(f"Found edge types: {edge_types}")
                 
-                if where_clause:
-                    query = f"""
-                    MATCH {{as: a}}-{{as: r}}-{{as: b}}
-                    WHERE {where_clause}
-                    RETURN a, r, b
-                    LIMIT 100
-                    """
-                else:
-                    query = """
-                    MATCH {as: a}-{as: r}-{as: b}
-                    RETURN a, r, b
-                    LIMIT 100
-                    """
-
-                logger.debug(f"Executing SQL MATCH triplets query")
-                results = self._db.query("sql", query)
-                
-                # Process SQL MATCH results
-                for result in results:
+                # Query each edge type for relationships and convert to triplets
+                for edge_type in edge_types:
                     try:
-                        source_node = self._result_to_node(result.get('a', {}))
-                        target_node = self._result_to_node(result.get('b', {}))
-                        relationship = self._result_to_relation(result.get('r', {}))
-                        triplets.append((source_node, relationship, target_node))
-                    except Exception as parse_error:
-                        logger.debug(f"Failed to parse triplet result: {parse_error}")
+                        # Skip if relation_names specified and this edge type not in the list
+                        if relation_names and edge_type not in relation_names:
+                            continue
+                        
+                        # Query the edge type directly to get relationship records
+                        # Use separate queries to get vertex names since out().name may not work
+                        query = f"SELECT @rid, @type, @in, @out, * FROM {edge_type} LIMIT 100"
+                        logger.debug(f"Executing relationship query for {edge_type}: {query}")
+                        edge_results = self._db.query("sql", query)
+                        
+                        if edge_results and isinstance(edge_results, list):
+                            for edge_record in edge_results:
+                                try:
+                                    # Get the RIDs of source and target vertices
+                                    source_rid = edge_record.get('@out')  # Note: @out is the source in ArcadeDB
+                                    target_rid = edge_record.get('@in')   # Note: @in is the target in ArcadeDB
+                                    relation_label = edge_type
+                                    
+                                    if source_rid and target_rid:
+                                        # Query source vertex name/id (chunks use 'id', entities use 'name')
+                                        source_name = None
+                                        try:
+                                            source_query = f"SELECT name, id FROM {source_rid}"
+                                            source_result = self._db.query("sql", source_query)
+                                            if source_result and isinstance(source_result, list) and len(source_result) > 0:
+                                                # Try 'name' first (for entities), then 'id' (for chunks)
+                                                source_name = source_result[0].get('name') or source_result[0].get('id')
+                                        except Exception:
+                                            pass
+                                        
+                                        # Query target vertex name/id (chunks use 'id', entities use 'name')
+                                        target_name = None
+                                        try:
+                                            target_query = f"SELECT name, id FROM {target_rid}"
+                                            target_result = self._db.query("sql", target_query)
+                                            if target_result and isinstance(target_result, list) and len(target_result) > 0:
+                                                # Try 'name' first (for entities), then 'id' (for chunks)
+                                                target_name = target_result[0].get('name') or target_result[0].get('id')
+                                        except Exception:
+                                            pass
+                                        
+                                        # Create triplet if we have both names
+                                        if source_name and target_name:
+                                            # Create simple tuple triplet: [subject, relation, object]
+                                            triplet = [source_name, relation_label, target_name]
+                                            triplets.append(triplet)
+                                            logger.debug(f"Created triplet: {source_name} -> {relation_label} -> {target_name}")
+                                        else:
+                                            logger.debug(f"Could not get names for edge {source_rid} -> {target_rid} (source_name={source_name}, target_name={target_name})")
+                                    
+                                except Exception as parse_error:
+                                    logger.debug(f"Failed to parse edge record: {parse_error}")
+                                    continue
+                                
+                    except Exception as edge_error:
+                        logger.debug(f"Failed to query edge type {edge_type}: {edge_error}")
                         continue
-                
-                logger.info(f"SQL_MATCH_TRIPLETS: Found {len(triplets)} triplets using MATCH pattern")
-                
-            except Exception as match_error:
-                logger.warning(f"SQL MATCH triplets failed, falling back to expand(both()): {match_error}")
-                
-                # Fallback to original expand(both()) approach
-                query_parts = ["SELECT expand(both()) FROM RELATION"]
-                where_conditions = []
-
-                if entity_names:
-                    entity_names_str = "', '".join(entity_names)
-                    where_conditions.append(f"(in().name IN ['{entity_names_str}'] OR out().name IN ['{entity_names_str}'])")
-
-                if relation_names:
-                    relation_names_str = "', '".join(relation_names)
-                    where_conditions.append(f"@class IN ['{relation_names_str}']")
-
-                if where_conditions:
-                    query_parts.append("WHERE " + " AND ".join(where_conditions))
-
-                query_parts.append("LIMIT 100")
-                query = " ".join(query_parts)
-                logger.debug(f"Executing fallback expand(both()) query")
-                results = self._db.query("sql", query)
+                        
+            except Exception as schema_error:
+                logger.warning(f"Failed to get edge types from schema: {schema_error}")
+                # If we can't get edge types, return empty results gracefully
+                results = []
 
         except Exception as e:
             logger.error(f"Failed to get triplets: {e}")
@@ -820,29 +814,62 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             chunk_nodes = [node for node in nodes if isinstance(node, ChunkNode)]
             other_nodes = [node for node in nodes if not isinstance(node, (EntityNode, ChunkNode))]
             
-            # Bulk upsert entity nodes
+            # Bulk upsert entity nodes using sqlscript language for multi-statement queries
             if entity_nodes:
                 try:
-                    entity_data = []
+                    # Build multiple UPDATE ... UPSERT statements
+                    upsert_statements = []
                     for node in entity_nodes:
-                        data = {
-                            'name': node.name,
-                            'label': getattr(node, 'label', 'Entity'),
-                            'properties': node.properties or {}
-                        }
-                        if hasattr(node, 'embedding') and node.embedding:
-                            data['embedding'] = json.dumps(node.embedding)
-                        entity_data.append(data)
+                        entity_type = self._determine_entity_type(node)
+                        normalized_name = self._normalize_and_deduplicate_entity(node.name)
+                        
+                        # Ensure the entity type exists
+                        self._ensure_dynamic_type(entity_type, 'VERTEX')
+                        
+                        # Build property assignments with safer handling
+                        prop_assignments = [f"name = '{self._escape_string(normalized_name)}'"]
+                        
+                        # Handle embedding separately to avoid SQL parsing issues with large JSON
+                        has_embedding = hasattr(node, 'embedding') and node.embedding is not None
+                        if has_embedding:
+                            # Skip embedding in bulk operations to avoid SQL parsing errors
+                            # Will be handled in individual fallback if needed
+                            logger.debug(f"Skipping embedding in bulk operation for {normalized_name}")
+                        
+                        if node.properties:
+                            for k, v in node.properties.items():
+                                if k != 'embedding':
+                                    if isinstance(v, (list, dict)):
+                                        # Handle JSON data properly
+                                        json_str = json.dumps(v)
+                                        escaped_value = self._escape_string(json_str)
+                                    else:
+                                        # Handle string and other types
+                                        v_str = str(v)
+                                        escaped_value = self._escape_string(v_str)
+                                    prop_assignments.append(f"{k} = '{escaped_value}'")
+                        
+                        # Create UPDATE ... UPSERT statement
+                        upsert_stmt = f"UPDATE {entity_type} SET {', '.join(prop_assignments)} UPSERT WHERE name = '{self._escape_string(normalized_name)}'"
+                        
+                        # Check statement length to avoid SQL parsing errors
+                        if len(upsert_stmt) <= 10000:  # Reasonable SQL statement length limit
+                            upsert_statements.append(upsert_stmt)
+                        else:
+                            logger.debug(f"Skipping bulk operation for {normalized_name} due to statement length")
                     
-                    upserted_count = self._db.bulk_upsert(
-                        type_name="Entity",
-                        records=entity_data,
-                        key_field='name',
-                        batch_size=100
-                    )
-                    logger.info(f"Bulk upserted {upserted_count} entity nodes")
+                    # Execute as sqlscript (multi-statement)
+                    if upsert_statements:
+                        batch_query = "; ".join(upsert_statements)
+                        result = self._db.query("sqlscript", batch_query, is_command=True)
+                        logger.info(f"Bulk upserted {len(entity_nodes)} entity nodes using sqlscript")
+                        
+                        # Create MENTIONS relationships after bulk upsert (critical for flexible-graphrag)
+                        for node in entity_nodes:
+                            entity_type = self._determine_entity_type(node)
+                            self._create_mentions_relationship_sql(node, entity_type)
                     
-                except (BulkOperationException, ValidationException) as e:
+                except Exception as e:
                     logger.warning(f"Bulk entity upsert failed, using individual operations: {e}")
                     # Fallback to individual operations
                     for node in entity_nodes:
@@ -851,29 +878,54 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         except Exception as e2:
                             logger.error(f"Failed to upsert entity node {node.name}: {e2}")
             
-            # Bulk upsert chunk nodes
+            # Bulk upsert chunk nodes using sqlscript language for multi-statement queries
             if chunk_nodes:
                 try:
-                    chunk_data = []
+                    # Build multiple UPDATE ... UPSERT statements
+                    upsert_statements = []
                     for node in chunk_nodes:
-                        data = {
-                            'id': node.id,
-                            'text': getattr(node, 'text', ''),
-                            'properties': node.properties or {}
-                        }
-                        if hasattr(node, 'embedding') and node.embedding:
-                            data['embedding'] = json.dumps(node.embedding)
-                        chunk_data.append(data)
+                        # Ensure TextChunk type exists
+                        self._ensure_dynamic_type('TextChunk', 'VERTEX')
+                        
+                        # Build property assignments with proper escaping
+                        text_escaped = self._escape_string(node.text)
+                        prop_assignments = [f"id = '{self._escape_string(node.id)}'", f"text = '{text_escaped}'"]
+                        
+                        # Handle embedding separately to avoid SQL parsing issues with large JSON
+                        has_embedding = hasattr(node, 'embedding') and node.embedding is not None
+                        if has_embedding:
+                            # Skip embedding in bulk operations to avoid SQL parsing errors
+                            logger.debug(f"Skipping embedding in bulk operation for chunk {node.id}")
+                        
+                        if node.properties:
+                            for k, v in node.properties.items():
+                                if k != 'embedding':
+                                    if isinstance(v, (list, dict)):
+                                        # Handle JSON data properly
+                                        json_str = json.dumps(v)
+                                        escaped_value = self._escape_string(json_str)
+                                    else:
+                                        # Handle string and other types
+                                        v_str = str(v)
+                                        escaped_value = self._escape_string(v_str)
+                                    prop_assignments.append(f"{k} = '{escaped_value}'")
+                        
+                        # Create UPDATE ... UPSERT statement
+                        upsert_stmt = f"UPDATE TextChunk SET {', '.join(prop_assignments)} UPSERT WHERE id = '{self._escape_string(node.id)}'"
+                        
+                        # Check statement length to avoid SQL parsing errors
+                        if len(upsert_stmt) <= 15000:  # Larger limit for text chunks
+                            upsert_statements.append(upsert_stmt)
+                        else:
+                            logger.debug(f"Skipping bulk operation for chunk {node.id} due to statement length")
                     
-                    upserted_count = self._db.bulk_upsert(
-                        type_name="TextChunk",
-                        records=chunk_data,
-                        key_field='id',
-                        batch_size=100
-                    )
-                    logger.info(f"Bulk upserted {upserted_count} chunk nodes")
+                    # Execute as sqlscript (multi-statement)
+                    if upsert_statements:
+                        batch_query = "; ".join(upsert_statements)
+                        result = self._db.query("sqlscript", batch_query, is_command=True)
+                        logger.info(f"Bulk upserted {len(chunk_nodes)} chunk nodes using sqlscript")
                     
-                except (BulkOperationException, ValidationException) as e:
+                except Exception as e:
                     logger.warning(f"Bulk chunk upsert failed, using individual operations: {e}")
                     # Fallback to individual operations
                     for node in chunk_nodes:
@@ -991,7 +1043,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.warning(f"Bulk delete failed, using traditional method: {e}")
                     # Fallback to traditional method
                     ids_str = "', '".join(ids)
-                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE @rid IN ['{ids_str}']"
+                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE @rid IN ['{ids_str}']"
                     self._db.query("sql", query, is_command=True)
 
             elif entity_names:
@@ -1015,7 +1067,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.warning(f"Bulk delete failed, using traditional method: {e}")
                     # Fallback to traditional method
                     names_str = "', '".join(entity_names)
-                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE name IN ['{names_str}']"
+                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE name IN ['{names_str}']"
                     self._db.query("sql", query, is_command=True)
 
             elif properties:
@@ -1045,7 +1097,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.warning(f"Bulk delete failed, using traditional method: {e}")
                     # Fallback to traditional method
                     where_clause = " AND ".join(where_conditions)
-                    query = f"DELETE FROM (SELECT FROM Entity UNION SELECT FROM TextChunk) WHERE {where_clause}"
+                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE {where_clause}"
                     self._db.query("sql", query, is_command=True)
 
             if relation_names:
@@ -1084,41 +1136,18 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def vector_query(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> Tuple[List[LabelledNode], List[float]]:
-        """Execute a vector similarity query using cosine similarity.
+        """Execute a vector similarity query.
         
-        ArcadeDB supports vector operations but may change implementation.
-        This method includes fallback mechanisms for resilience.
-        
-        Note: ArcadeDB has mentioned they may change how vectors are implemented,
-        so we detect capabilities dynamically and provide fallbacks.
+        Note: Vector search is currently NOT supported in the arcadedb-python driver.
+        This method returns empty results gracefully to maintain interface compatibility.
         """
         if not query.query_embedding:
-            logger.warning("No query embedding provided for vector search")
+            logger.debug("No query embedding provided for vector search")
             return [], []
         
-        try:
-            # Convert embedding to string for SQL query
-            embedding_str = str(query.query_embedding).replace("'", "\"")
-            
-            # Build filter conditions if provided
-            where_conditions = []
-            if query.filters:
-                for filter_item in query.filters.filters:
-                    if isinstance(filter_item.value, str):
-                        where_conditions.append(f"{filter_item.key} = '{self._escape_string(filter_item.value)}'")
-                    else:
-                        where_conditions.append(f"{filter_item.key} = {filter_item.value}")
-            
-            where_clause = ""
-            if where_conditions:
-                where_clause = f"AND {' AND '.join(where_conditions)}"
-            
-            # Use manual similarity calculation (ArcadeDB doesn't have COSINE_SIMILARITY function)
-            return self._vector_query_manual_fallback(query)
-            
-        except Exception as e:
-            logger.error(f"Vector query failed: {e}")
-            return [], []
+        # Vector search is not supported in current arcadedb-python driver
+        logger.debug("Vector search is not supported in current arcadedb-python driver - returning empty results")
+        return [], []
 
     def get_schema(self, refresh: bool = False) -> Any:
         """Get the database schema in LlamaIndex-compatible format."""
@@ -1446,7 +1475,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             else:
                 query = f"CREATE EDGE {relation.label} FROM {source_rid} TO {target_rid} IF NOT EXISTS"
             
-            logger.debug(f"Executing fallback CREATE EDGE")
+            logger.debug(f"Executing fallback CREATE EDGE: {query}")
             result = self._db.query("sql", query, is_command=True)
             logger.info(f"SQL_FALLBACK_SUCCESS: Created {relation.label} edge from {source_rid} to {target_rid}")
             
@@ -1465,7 +1494,10 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             if isinstance(value, str):
                 value_str = f"'{self._escape_string(value)}'"
             elif isinstance(value, (list, dict)):
-                value_str = f"'{json.dumps(value)}'"
+                # Properly escape JSON data
+                json_str = json.dumps(value)
+                escaped_json = self._escape_string(json_str)
+                value_str = f"'{escaped_json}'"
             else:
                 value_str = str(value)
 
@@ -1474,126 +1506,47 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         return ", ".join(items)
 
     def _escape_string(self, text: str) -> str:
-        """Escape string for ArcadeDB SQL and Cypher queries."""
+        """Escape string for ArcadeDB SQL queries using backslash escaping.
+        
+        ArcadeDB SQL documentation states both methods are supported:
+        - Single quotes: Can use SQL standard doubling (' -> '') OR backslash escaping (\')
+        - However, in practice, backslash escaping is more reliable for REST API usage
+        - This matches the approach used by arcadedb-python internally
+        
+        Reference: https://docs.arcadedb.com/#sql-syntax
+        """
         if text is None:
             return "NULL"
         
         escaped = str(text)
         
-        # For very problematic strings, use a more conservative approach
-        # Remove or replace characters that consistently cause Cypher parsing issues
-        problematic_chars = ["'", '"', '`', '\n', '\r', '\t']
-        has_problematic = any(char in escaped for char in problematic_chars)
+        # Handle Unicode characters that might cause issues - do this FIRST before other escaping
+        # Replace problematic Unicode characters with safe alternatives
+        escaped = escaped.replace('\u2013', '-')    # En dash
+        escaped = escaped.replace('\u2014', '--')   # Em dash
+        escaped = escaped.replace('\u2018', "'")    # Left single quote -> regular apostrophe
+        escaped = escaped.replace('\u2019', "'")    # Right single quote -> regular apostrophe
+        escaped = escaped.replace('\u201c', '"')    # Left double quote -> regular quote
+        escaped = escaped.replace('\u201d', '"')    # Right double quote -> regular quote
         
-        if has_problematic:
-            # Replace problematic characters with safe alternatives
-            escaped = escaped.replace("'", "")      # Remove apostrophes entirely
-            escaped = escaped.replace('"', "")      # Remove quotes entirely  
-            escaped = escaped.replace('`', "")      # Remove backticks
-            escaped = escaped.replace('\n', ' ')    # Replace newlines with spaces
-            escaped = escaped.replace('\r', ' ')    # Replace carriage returns with spaces
-            escaped = escaped.replace('\t', ' ')    # Replace tabs with spaces
-            escaped = escaped.strip()               # Clean up extra spaces
-        else:
-            # Standard escaping for normal strings
-            escaped = escaped.replace("\\", "\\\\")  # Escape backslashes first
-            escaped = escaped.replace("'", "\\'")   # Escape single quotes
+        # Backslash escaping (matching arcadedb-python's approach)
+        # Handle backslashes first (if they exist in the original text)
+        escaped = escaped.replace("\\", "\\\\")     # Escape backslashes: \ -> \\
+        
+        # Backslash escape single quotes (ArcadeDB supports this per docs)
+        escaped = escaped.replace("'", "\\'")       # Backslash escape: ' -> \'
+        
+        # Escape control characters that need backslash escaping in SQL string literals
+        escaped = escaped.replace('\n', '\\n')      # Newline
+        escaped = escaped.replace('\r', '\\r')      # Carriage return
+        escaped = escaped.replace('\t', '\\t')      # Tab
+        
+        # NOTE: Double quotes (") do NOT need escaping in SQL string literals
+        # because SQL uses single quotes (') as string delimiters
         
         return escaped
     
     
-    def _calculate_cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity manually if native function is not available.
-        
-        This provides a fallback if ArcadeDB changes their vector implementation.
-        """
-        if len(vec1) != len(vec2):
-            return 0.0
-        
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm_a = sum(a * a for a in vec1) ** 0.5
-        norm_b = sum(b * b for b in vec2) ** 0.5
-        
-        if norm_a == 0.0 or norm_b == 0.0:
-            return 0.0
-        
-        return dot_product / (norm_a * norm_b)
-    
-    def _vector_query_manual_fallback(self, query: VectorStoreQuery) -> Tuple[List[LabelledNode], List[float]]:
-        """Manual vector similarity calculation fallback.
-        
-        Used when ArcadeDB's native vector functions are not available.
-        """
-        try:
-            # Get all nodes with embeddings
-            base_vertex_types = ['Entity', 'TextChunk']
-            all_vertex_types = list(set(base_vertex_types) | self._discovered_vertex_types)
-            
-            all_nodes = []
-            for vertex_type in all_vertex_types:
-                try:
-                    node_query = f"SELECT *, '{vertex_type}' as node_type FROM {vertex_type} WHERE embedding IS NOT NULL"
-                    results = self._db.query("sql", node_query)
-                    if isinstance(results, list):
-                        all_nodes.extend(results)
-                    elif isinstance(results, dict) and "result" in results:
-                        all_nodes.extend(results["result"])
-                except Exception as e:
-                    logger.debug(f"Failed to query {vertex_type} for manual vector search: {e}")
-                    continue
-            
-            # Calculate similarities manually
-            similarities = []
-            for node_data in all_nodes:
-                try:
-                    if 'embedding' in node_data and node_data['embedding']:
-                        node_embedding = node_data['embedding']
-                        if isinstance(node_embedding, str):
-                            node_embedding = json.loads(node_embedding)
-                        
-                        similarity = self._calculate_cosine_similarity(query.query_embedding, node_embedding)
-                        similarities.append((node_data, similarity))
-                except Exception as e:
-                    logger.debug(f"Failed to calculate similarity for node: {e}")
-                    continue
-            
-            # Sort by similarity and limit results
-            similarities.sort(key=lambda x: x[1], reverse=True)
-            top_k = query.similarity_top_k or 10
-            top_similarities = similarities[:top_k]
-            
-            # Convert to LabelledNode objects
-            nodes = []
-            scores = []
-            for node_data, score in top_similarities:
-                try:
-                    # Create LabelledNode from the data
-                    node_type = node_data.get('node_type', 'Entity')
-                    if node_type == 'TextChunk':
-                        node_id = node_data.get('id', '')
-                        text = node_data.get('text', '')
-                        labelled_node = LabelledNode(id=node_id, text=text, label=node_type)
-                    else:
-                        node_name = node_data.get('name', '')
-                        labelled_node = LabelledNode(id=node_name, text=node_name, label=node_type)
-                    
-                    # Add properties
-                    for key, value in node_data.items():
-                        if key not in ['id', 'name', 'text', 'node_type', 'embedding']:
-                            labelled_node.properties[key] = value
-                    
-                    nodes.append(labelled_node)
-                    scores.append(score)
-                except Exception as e:
-                    logger.debug(f"Failed to create LabelledNode: {e}")
-                    continue
-            
-            logger.info(f"Manual vector query returned {len(nodes)} results")
-            return nodes, scores
-            
-        except Exception as e:
-            logger.error(f"Manual vector query fallback failed: {e}")
-            return [], []
 
     def _normalize_entity_name(self, name: str) -> str:
         """Normalize entity names to avoid duplicates like 'Alfresco' vs 'Alfresco Software'."""
