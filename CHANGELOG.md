@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-02] - 0.4.0 Release: native vector support, fixed delete nodes, added tests
+
+### Added
+- `vector_query()` implemented using ArcadeDB's native LSM_VECTOR index
+- Two-phase embedding write (`_update_embedding()`) 
+- `_ensure_property()` — dynamic schema property declaration with cache
+- `_sql_identifier()` — backtick-quotes property names containing spaces (e.g. `modified at`)
+- `_get_all_vertex_types()` — live schema query helper
+
+### Changed
+- Fixed delete nodes so flexible-graphrag auto incremental update could use
+- `get_rel_map()` rewritten: resolves node names to `@rid` values before traversal, reads correct `@in`/`@out` edge fields, replaces broken OrientDB MATCH syntax
+- `upsert_nodes()` restructured; 
+- Exception handling updated to use typed exceptions (`VectorOperationException`, `TransactionException`, `SchemaException`) from arcadedb-python
+- "Already exists" on LSM_VECTOR index creation demoted from ERROR to DEBUG on reconnect
+- Entity classification fixes for acronyms and multi-word company names
+- 4 test files updated; 6 new delete/vector tests added to `test_arcadedb_integration.py`
+
+### Dependencies
+- Package version `0.3.1` → `0.4.0`; requires `arcadedb-python>=0.4.0`
+
+---
+
 ## [2025-10-26] - 0.3.1 release: use arcadedb-python 0.3.1, updates to pass all tests, and not get some query errors
 
 ### Changed

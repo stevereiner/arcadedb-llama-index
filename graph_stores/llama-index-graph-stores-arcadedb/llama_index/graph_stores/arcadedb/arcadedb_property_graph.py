@@ -42,11 +42,12 @@ try:
         ValidationException,
         BulkOperationException,
         TransactionException,
+        VectorOperationException,
     )
 except ImportError as e:
     raise ImportError(
-        "arcadedb_python>=0.3.0 is required for ArcadeDB integration. "
-        "Install it with: pip install arcadedb-python>=0.3.0"
+        "arcadedb_python>=0.4.0 is required for ArcadeDB integration. "
+        "Install it with: pip install arcadedb-python>=0.4.0"
     ) from e
 
 from llama_index.core.graph_stores.types import (
@@ -115,6 +116,9 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # Track dynamically discovered schema
         self._discovered_vertex_types = set()
         self._discovered_edge_types = set()
+        # Cache of (type_name, prop_name) pairs whose DDL has already been sent,
+        # so _ensure_property() skips redundant CREATE PROPERTY calls.
+        self._known_properties: set = set()
 
         # Initialize ArcadeDB client with the FIXED version
         try:
@@ -231,30 +235,56 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     # Even if type exists, ensure properties are created
                     if type_kind == 'VERTEX':
                         self._create_vertex_properties(type_name)
+                        self._discovered_vertex_types.add(type_name)
+                    else:
+                        self._discovered_edge_types.add(type_name)
                     continue
                     
                 try:
                     query = f"CREATE {type_kind} TYPE {type_name}"
                     result = self._db.query("sql", query, is_command=True)
-                    logger.info(f"Schema created successfully: {query}")
+                    logger.debug(f"Schema created successfully: {query}")
                     
                     # For VERTEX types, create essential properties with correct data types
                     if type_kind == 'VERTEX':
                         self._create_vertex_properties(type_name)
+                        self._discovered_vertex_types.add(type_name)
+                    else:
+                        self._discovered_edge_types.add(type_name)
                     
                     created_count += 1
-                except Exception as e:
-                    error_msg = str(e)
-                    # If it fails because it's "not idempotent", the type likely already exists
-                    if "not idempotent" in error_msg:
+                except (TransactionException, SchemaException) as e:
+                    # TransactionException with is_idempotent_error or SchemaException
+                    # both indicate the type already exists — treat as success.
+                    already_exists = (
+                        (isinstance(e, TransactionException) and e.is_idempotent_error)
+                        or "already exists" in (e.detail or '').lower()
+                        or "not idempotent" in str(e).lower()
+                    )
+                    if already_exists:
                         logger.info(f"Type {type_name} already exists (idempotent error), ensuring properties exist")
-                        # Even if type exists, ensure properties are created
                         if type_kind == 'VERTEX':
                             self._create_vertex_properties(type_name)
+                            self._discovered_vertex_types.add(type_name)
+                        else:
+                            self._discovered_edge_types.add(type_name)
                         continue
                     else:
                         logger.error(f"Schema creation failed: CREATE {type_kind} TYPE {type_name} - {e}")
-                        # Don't continue if critical types fail with non-idempotent errors
+                        if type_name in ['Entity', 'TextChunk']:
+                            raise ValidationException(f"Critical type creation failed: {type_name}")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "not idempotent" in error_msg or "already exists" in error_msg:
+                        logger.info(f"Type {type_name} already exists, ensuring properties exist")
+                        if type_kind == 'VERTEX':
+                            self._create_vertex_properties(type_name)
+                            self._discovered_vertex_types.add(type_name)
+                        else:
+                            self._discovered_edge_types.add(type_name)
+                        continue
+                    else:
+                        logger.error(f"Schema creation failed: CREATE {type_kind} TYPE {type_name} - {e}")
                         if type_name in ['Entity', 'TextChunk']:
                             raise ValidationException(f"Critical type creation failed: {type_name}")
 
@@ -329,13 +359,28 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             else:
                 self._discovered_edge_types.add(type_name)
                 
-            logger.info(f"Dynamically created {type_kind} type: {type_name}")
+            logger.debug(f"Dynamically created {type_kind} type: {type_name}")
             return True
             
+        except (TransactionException, SchemaException) as e:
+            already_exists = (
+                (isinstance(e, TransactionException) and e.is_idempotent_error)
+                or "already exists" in (e.detail or '').lower()
+                or "not idempotent" in str(e).lower()
+            )
+            if already_exists:
+                if type_kind == 'VERTEX':
+                    self._create_vertex_properties(type_name)
+                    self._discovered_vertex_types.add(type_name)
+                else:
+                    self._discovered_edge_types.add(type_name)
+                return True
+            else:
+                logger.warning(f"Failed to create dynamic {type_kind} type {type_name}: {e}")
+                return False
         except Exception as e:
             error_msg = str(e)
             if "not idempotent" in error_msg or "already exists" in error_msg:
-                # Type already exists, but still ensure properties exist
                 if type_kind == 'VERTEX':
                     self._create_vertex_properties(type_name)
                     self._discovered_vertex_types.add(type_name)
@@ -355,19 +400,21 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 properties = [
                     ('id', 'STRING', ''),
                     ('text', 'STRING', ''),
-                    ('embedding', 'STRING', '(hidden true)')  # Hidden JSON string for embeddings
+                    ('ref_doc_id', 'STRING', ''),  # Stored so delete(properties={'ref_doc_id':...}) works
+                    ('embedding', 'ARRAY_OF_FLOATS', '')  # Native float array for LSM_VECTOR index
                 ]
             else:
                 # Entity types use 'name' as primary key (STRING)
                 properties = [
                     ('name', 'STRING', ''),
-                    ('embedding', 'STRING', '(hidden true)')  # Hidden JSON string for embeddings
+                    ('embedding', 'ARRAY_OF_FLOATS', '')  # Native float array for LSM_VECTOR index
                 ]
             
             # Create each property with proper data type using correct IF NOT EXISTS syntax
             for prop_name, prop_type, constraints in properties:
                 try:
-                    prop_query = f"CREATE PROPERTY {type_name}.{prop_name} IF NOT EXISTS {prop_type} {constraints}".strip()
+                    safe_pname = self._sql_identifier(prop_name)
+                    prop_query = f"CREATE PROPERTY {type_name}.{safe_pname} IF NOT EXISTS {prop_type} {constraints}".strip()
                     self._db.query("sql", prop_query, is_command=True)
                     logger.debug(f"Created property {type_name}.{prop_name} ({prop_type})")
                 except Exception as prop_error:
@@ -385,9 +432,89 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.debug(f"Index on {type_name}.{primary_key} already exists")
                 else:
                     logger.debug(f"Index creation for {type_name}.{primary_key}: {index_error}")
-                    
+
+            # Create LSM_VECTOR index on embedding if dimension is configured
+            if self.embedding_dimension:
+                self._ensure_vector_index(type_name, 'embedding', self.embedding_dimension)
+
+            # Mark all declared properties as known so _ensure_property() won't
+            # re-send DDL for them.
+            for prop_name, _, _ in properties:
+                self._known_properties.add((type_name, prop_name))
+
         except Exception as e:
             logger.warning(f"Failed to create properties for {type_name}: {e}")
+
+    def _update_embedding(self, type_name: str, key_field: str, key_value: str,
+                          embedding: list) -> None:
+        """Store an embedding vector on an already-existing record.
+
+        The LSM_VECTOR index requires a native float array literal, which cannot
+        appear inside an UPDATE...UPSERT SET clause (the SQL parser rejects it).
+        This method issues a plain UPDATE after the UPSERT has committed, using
+        the unquoted array syntax that ArcadeDB accepts for ARRAY_OF_FLOATS.
+        """
+        try:
+            array_literal = json.dumps(embedding)  # produces [0.1, 0.2, ...]
+            escaped_key = self._escape_string(key_value)
+            q = (
+                f"UPDATE {type_name} SET embedding = {array_literal}"
+                f" WHERE {key_field} = '{escaped_key}'"
+            )
+            self._db.query("sql", q, is_command=True)
+        except Exception as e:
+            err = str(e)[:200]
+            logger.debug(f"_update_embedding failed for {type_name}.{key_field}='{key_value}': {err}")
+
+    def _ensure_property(self, type_name: str, prop_name: str, prop_type: str = 'STRING') -> None:
+        """Declare a property on a vertex type if it has not been declared yet.
+
+        Uses an in-memory cache keyed by (type_name, prop_name) so the DDL
+        statement is only sent once per process lifetime, keeping the hot path
+        cheap after the first call.
+        """
+        cache_key = (type_name, prop_name)
+        if cache_key in self._known_properties:
+            return
+        try:
+            safe_pname = self._sql_identifier(prop_name)
+            self._db.query(
+                "sql",
+                f"CREATE PROPERTY {type_name}.{safe_pname} IF NOT EXISTS {prop_type}",
+                is_command=True,
+            )
+        except Exception as e:
+            logger.debug(f"_ensure_property {type_name}.{prop_name}: {e}")
+        # Mark as known regardless — even if DDL failed the property may already exist
+        self._known_properties.add(cache_key)
+
+    def _ensure_vector_index(self, type_name: str, embedding_field: str, dimensions: int) -> None:
+        """Create an LSM_VECTOR index on the embedding field if it doesn't already exist."""
+        import logging as _logging
+        # The arcadedb-python SyncClient logs every non-2xx response at ERROR level
+        # before raising.  Temporarily silence it so "already exists" isn't noisy.
+        _driver_logger = _logging.getLogger('arcadedb_python.api.sync')
+        _orig_level = _driver_logger.level
+        _driver_logger.setLevel(_logging.CRITICAL)
+        try:
+            self._db.create_vector_index(type_name, embedding_field, dimensions)
+            logger.debug(f"Created LSM_VECTOR index on {type_name}.{embedding_field} (dim={dimensions})")
+        except VectorOperationException as e:
+            # The driver raises VectorOperationException without forwarding the ArcadeDB
+            # detail, but the original exception is chained via __cause__.  Check the
+            # full chain for "already exists" before treating it as a real error.
+            cause_detail = ''
+            if e.__cause__ is not None:
+                cause = e.__cause__
+                cause_detail = (getattr(cause, 'detail', None) or str(cause)).lower()
+            if "already exists" in cause_detail:
+                logger.debug(f"LSM_VECTOR index on {type_name}.{embedding_field} already exists")
+            else:
+                logger.warning(f"Could not create LSM_VECTOR index on {type_name}.{embedding_field}: {e}")
+        except Exception as e:
+            logger.warning(f"Could not create LSM_VECTOR index on {type_name}.{embedding_field}: {e}")
+        finally:
+            _driver_logger.setLevel(_orig_level)
 
     def _create_indexes(self) -> None:
         """Create basic indexes for better query performance."""
@@ -473,6 +600,21 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             else:
                 logger.warning(f"Failed to create UNIQUE index on {type_name}.{property_name}: {e}")
 
+    def _get_all_vertex_types(self) -> List[str]:
+        """Return every vertex type currently in the schema.
+
+        Falls back to a hard-coded list of known types when the schema query
+        fails (e.g. during early initialisation).
+        """
+        try:
+            result = self._db.query("sql", "SELECT name FROM schema:types WHERE type = 'vertex'")
+            if result and isinstance(result, list):
+                return [r['name'] for r in result if isinstance(r, dict) and 'name' in r]
+        except Exception as e:
+            logger.debug(f"Schema vertex-type query failed: {e}")
+        # Fallback: essential types + everything we have dynamically discovered
+        return list({'Entity', 'TextChunk'} | self._discovered_vertex_types)
+
     def get(
         self,
         properties: Optional[dict] = None,
@@ -529,11 +671,12 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 # Query by properties - query all vertex type tables
                 where_conditions = []
                 for key, value in properties.items():
+                    safe_key = self._sql_identifier(key)
                     if isinstance(value, str):
                         escaped_value = self._escape_string(value)
-                        where_conditions.append(f"{key} = '{escaped_value}'")
+                        where_conditions.append(f"{safe_key} = '{escaped_value}'")
                     else:
-                        where_conditions.append(f"{key} = {value}")
+                        where_conditions.append(f"{safe_key} = {value}")
 
                 where_clause = " AND ".join(where_conditions)
                 
@@ -595,7 +738,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[List[str]]:
-        """Get triplets (relationships) with matching criteria using v0.3.0+ features."""
+        """Get triplets (relationships) with matching criteria using v0.4.0+ features."""
         triplets = []
 
         try:
@@ -631,7 +774,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         
                         # Query the edge type directly to get relationship records
                         # Use separate queries to get vertex names since out().name may not work
-                        query = f"SELECT @rid, @type, @in, @out, * FROM {edge_type} LIMIT 100"
+                        query = f"SELECT @rid, @in, @out FROM {edge_type} LIMIT 100"
                         logger.debug(f"Executing relationship query for {edge_type}: {query}")
                         edge_results = self._db.query("sql", query)
                         
@@ -707,91 +850,115 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             return triplets
 
         try:
-            # Get node IDs with proper escaping
+            # Resolve logical node ids/names to ArcadeDB @rid values.
+            # TRAVERSE / MATCH both require real RIDs — passing string names fails.
             node_ids = [node.id for node in graph_nodes]
-            escaped_ids = [self._escape_string(node_id) for node_id in node_ids]
-            ids_str = "', '".join(escaped_ids)
 
-            # Try SQL MATCH for more intuitive graph traversal, fallback to TRAVERSE
-            try:
-                # Build ignore conditions for relationship types
-                ignore_conditions = []
-                if ignore_rels:
-                    escaped_ignore_rels = [self._escape_string(rel) for rel in ignore_rels]
-                    ignore_conditions = [f"r.@class != '{rel}'" for rel in escaped_ignore_rels]
-                
-                # Build node matching conditions (handle both id and name fields)
-                node_conditions = []
-                for node_id in escaped_ids:
-                    node_conditions.extend([
-                        f"start.id = '{node_id}'",
-                        f"start.name = '{node_id}'"
-                    ])
-                
-                # Build WHERE clause
-                where_conditions = [f"({' OR '.join(node_conditions)})"]
-                if ignore_conditions:
-                    where_conditions.extend(ignore_conditions)
-                
-                where_clause = " AND ".join(where_conditions)
-                
-                # Use SQL MATCH for relationship traversal (more Cypher-like)
-                if depth == 1:
-                    # Single hop - direct relationships
-                    query = f"""
-                    MATCH {{as: start}}-{{as: r}}-{{as: end}}
-                    WHERE {where_clause}
-                    RETURN start, r, end
-                    LIMIT {limit}
-                    """
-                else:
-                    # Multi-hop - use multiple MATCH patterns for different depths
-                    # For now, use depth 1 and 2 explicitly (ArcadeDB SQL MATCH variable-length paths are complex)
-                    query = f"""
-                    MATCH {{as: start}}-{{as: r}}-{{as: end}}
-                    WHERE {where_clause}
-                    RETURN start, r, end
-                    LIMIT {limit}
-                    """
-                
-                logger.debug(f"Executing SQL MATCH rel_map query")
-                results = self._db.query("sql", query)
-                
-                # Process SQL MATCH results
-                for result in results:
+            vertex_types = self._get_all_vertex_types()
+            start_rids: List[str] = []
+            for node_id in node_ids:
+                escaped = self._escape_string(node_id)
+                normalized = self._normalize_and_deduplicate_entity(node_id)
+                escaped_norm = self._escape_string(normalized)
+                for vtype in vertex_types:
                     try:
-                        start_data = result.get('start', {})
-                        rel_data = result.get('r', {})
-                        end_data = result.get('end', {})
-                        
-                        start_node = self._result_to_node(start_data)
-                        end_node = self._result_to_node(end_data)
-                        relationship = self._result_to_relation(rel_data)
-                        
-                        triplets.append((start_node, relationship, end_node))
-                    except Exception as parse_error:
-                        logger.debug(f"Failed to parse rel_map result: {parse_error}")
+                        if vtype == 'TextChunk':
+                            q = f"SELECT @rid FROM {vtype} WHERE id = '{escaped}' LIMIT 1"
+                        else:
+                            q = (
+                                f"SELECT @rid FROM {vtype}"
+                                f" WHERE name = '{escaped}' OR name = '{escaped_norm}'"
+                                f" LIMIT 1"
+                            )
+                        rows = self._db.query("sql", q)
+                        if rows:
+                            rid_val = str(rows[0]['@rid'])
+                            start_rids.append(rid_val)
+                            logger.debug(f"get_rel_map: resolved '{node_id}' -> {rid_val} in {vtype}")
+                            break
+                    except Exception:
                         continue
-                
-                logger.info(f"SQL_MATCH_REL_MAP: Found {len(triplets)} relationships using MATCH pattern")
-                
-            except Exception as match_error:
-                logger.warning(f"SQL MATCH rel_map failed, falling back to TRAVERSE: {match_error}")
-                
-                # Fallback to original TRAVERSE approach
-                ignore_clause = ""
-                if ignore_rels:
-                    ignore_types = "', '".join(ignore_rels)
-                    ignore_clause = f"AND @class NOT IN ['{ignore_types}']"
 
-                query = f"""
-                SELECT expand(both()) FROM (
-                    TRAVERSE both() FROM ['{ids_str}'] MAXDEPTH {depth}
-                ) WHERE @class INSTANCEOF 'E' {ignore_clause}
-                LIMIT {limit}
-                """
-                logger.debug(f"Executing fallback TRAVERSE query")
+            if not start_rids:
+                logger.info(f"get_rel_map: no RIDs resolved for node_ids={node_ids}, returning empty")
+                return triplets
+
+            # Fetch all edges touching the resolved start vertices up to `depth` hops.
+            # Use expand(bothE()) for depth=1 — it returns edge records directly and is
+            # the most reliable ArcadeDB form.  For depth>1 we use TRAVERSE but select
+            # only *, relying on Python post-filtering to identify edges (records that
+            # have both 'in' and 'out' fields).  We never put @-prefixed system fields
+            # in the SELECT list (ArcadeDB rejects them there) and we apply the
+            # ignore_rels filter in Python so we don't need @class in a WHERE clause.
+            rids_csv = ", ".join(start_rids)
+            if depth <= 1:
+                query = f"SELECT expand(bothE()) FROM [{rids_csv}] LIMIT {limit}"
+            else:
+                query = (
+                    f"SELECT * FROM ("
+                    f"  TRAVERSE bothE() FROM [{rids_csv}] MAXDEPTH {depth}"
+                    f") WHERE @this INSTANCEOF 'E'"
+                    f" LIMIT {limit}"
+                )
+            logger.debug(f"get_rel_map query: {query}")
+            try:
                 results = self._db.query("sql", query)
+                logger.debug(f"get_rel_map raw results: {len(results)} rows")
+            except Exception as trav_err:
+                logger.error(f"Failed to get relationship map: {trav_err}\nQuery: {query}")
+                return triplets
+
+            ignore_set = set(ignore_rels) if ignore_rels else set()
+
+            for result in results:
+                try:
+                    edge_class = result.get('@type', result.get('@class', ''))
+                    # ArcadeDB returns edge endpoints as '@in' / '@out' (system fields),
+                    # not 'in' / 'out' (which are OrientDB conventions).
+                    out_rid = result.get('@out', result.get('out'))
+                    in_rid  = result.get('@in',  result.get('in'))
+
+                    # Skip vertex records that leaked through (no in/out) and ignored types
+                    if not out_rid or not in_rid:
+                        logger.debug(f"get_rel_map: skipping non-edge record type={edge_class} keys={list(result.keys())[:8]}")
+                        continue
+                    if edge_class in ignore_set:
+                        continue
+
+                    # ArcadeDB may return out/in as a RID string "#x:y" or as a
+                    # dict {"@rid": "#x:y"} depending on the driver version.
+                    def _rid_str(val: Any) -> str:
+                        if isinstance(val, dict):
+                            return str(val.get('@rid', val))
+                        return str(val)
+
+                    def _fetch_vertex(rid_val: Any) -> dict:
+                        rid_s = _rid_str(rid_val)
+                        try:
+                            rows = self._db.query("sql", f"SELECT * FROM {rid_s} LIMIT 1")
+                            return rows[0] if rows else {}
+                        except Exception as fe:
+                            logger.debug(f"get_rel_map: vertex fetch failed for {rid_s}: {fe}")
+                            return {}
+
+                    out_data = _fetch_vertex(out_rid)
+                    in_data  = _fetch_vertex(in_rid)
+
+                    src_node = self._result_to_node(out_data)
+                    dst_node = self._result_to_node(in_data)
+
+                    # Build a minimal relation dict for _result_to_relation
+                    rel_data = dict(result)
+                    rel_data.setdefault('label', edge_class)
+                    relationship = self._result_to_relation(rel_data)
+
+                    triplets.append((src_node, relationship, dst_node))
+                    logger.debug(f"get_rel_map: triplet {src_node.id} -[{edge_class}]-> {dst_node.id}")
+                except Exception as parse_err:
+                    logger.debug(f"Failed to parse rel_map edge: {parse_err}")
+                    continue
+
+            logger.info(f"get_rel_map: found {len(triplets)} triplets for {len(start_rids)} start vertices")
 
         except Exception as e:
             logger.error(f"Failed to get relationship map: {e}")
@@ -799,7 +966,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         return triplets
 
     def upsert_nodes(self, nodes: Sequence[LabelledNode]) -> None:
-        """Insert or update nodes in the graph using v0.3.0+ bulk operations."""
+        """Insert or update nodes in the graph using v0.4.0+ bulk operations."""
         # Debug: Count node types being received
         entity_count = sum(1 for node in nodes if isinstance(node, EntityNode))
         chunk_count = sum(1 for node in nodes if isinstance(node, ChunkNode))
@@ -814,125 +981,166 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             chunk_nodes = [node for node in nodes if isinstance(node, ChunkNode)]
             other_nodes = [node for node in nodes if not isinstance(node, (EntityNode, ChunkNode))]
             
-            # Bulk upsert entity nodes using sqlscript language for multi-statement queries
+            # Upsert entity nodes one statement at a time (sql + is_command=True).
+            # sqlscript batched via the command endpoint is unreliable in ArcadeDB -
+            # it can silently produce no output and write nothing.  Executing each
+            # UPDATE ... UPSERT as an individual sql command is safe, gives per-node
+            # error isolation, and still falls back to _upsert_entity_node on failure.
             if entity_nodes:
-                try:
-                    # Build multiple UPDATE ... UPSERT statements
-                    upsert_statements = []
-                    for node in entity_nodes:
-                        entity_type = self._determine_entity_type(node)
-                        normalized_name = self._normalize_and_deduplicate_entity(node.name)
-                        
-                        # Ensure the entity type exists
+                # Phase 1: ensure all required schema types and indexes exist before
+                # writing any data.  The UPSERT clause requires a UNIQUE index on the
+                # key field; creating it here (once per type) means the UPDATE...UPSERT
+                # in Phase 2 will succeed rather than falling through to INSERT.
+                seen_types: set = set()
+                for node in entity_nodes:
+                    entity_type = self._determine_entity_type(node)
+                    if entity_type in seen_types:
+                        continue
+                    seen_types.add(entity_type)
+                    try:
                         self._ensure_dynamic_type(entity_type, 'VERTEX')
-                        
-                        # Build property assignments with safer handling
+                    except Exception as schema_err:
+                        logger.warning(f"ENTITY_TYPE_DETECTION: Could not ensure type {entity_type}: {schema_err}")
+                    try:
+                        self._ensure_index_for_upsert(entity_type, 'name')
+                    except Exception as idx_err:
+                        logger.debug(f"Index ensure skipped for {entity_type}.name: {idx_err}")
+
+                # Phase 2: write each node individually so failures are isolated
+                succeeded = 0
+                for node in entity_nodes:
+                    entity_type = self._determine_entity_type(node)
+                    normalized_name = self._normalize_and_deduplicate_entity(node.name)
+                    logger.debug(f"LLM_ENTITY_INPUT: {normalized_name} (type={entity_type})")
+                    try:
+                        # Build property assignments — embedding is excluded here
+                        # and stored separately via _update_embedding() because the
+                        # LSM_VECTOR index requires a native array literal which the
+                        # SQL parser rejects inside an UPDATE...UPSERT SET clause.
                         prop_assignments = [f"name = '{self._escape_string(normalized_name)}'"]
-                        
-                        # Handle embedding separately to avoid SQL parsing issues with large JSON
+
                         has_embedding = hasattr(node, 'embedding') and node.embedding is not None
-                        if has_embedding:
-                            # Skip embedding in bulk operations to avoid SQL parsing errors
-                            # Will be handled in individual fallback if needed
-                            logger.debug(f"Skipping embedding in bulk operation for {normalized_name}")
-                        
+
                         if node.properties:
                             for k, v in node.properties.items():
                                 if k != 'embedding':
+                                    self._ensure_property(entity_type, k)
+                                    safe_k = self._sql_identifier(k)
                                     if isinstance(v, (list, dict)):
-                                        # Handle JSON data properly
-                                        json_str = json.dumps(v)
-                                        escaped_value = self._escape_string(json_str)
+                                        escaped_value = self._escape_string(json.dumps(v))
                                     else:
-                                        # Handle string and other types
-                                        v_str = str(v)
-                                        escaped_value = self._escape_string(v_str)
-                                    prop_assignments.append(f"{k} = '{escaped_value}'")
-                        
-                        # Create UPDATE ... UPSERT statement
-                        upsert_stmt = f"UPDATE {entity_type} SET {', '.join(prop_assignments)} UPSERT WHERE name = '{self._escape_string(normalized_name)}'"
-                        
-                        # Check statement length to avoid SQL parsing errors
-                        if len(upsert_stmt) <= 10000:  # Reasonable SQL statement length limit
-                            upsert_statements.append(upsert_stmt)
-                        else:
-                            logger.debug(f"Skipping bulk operation for {normalized_name} due to statement length")
-                    
-                    # Execute as sqlscript (multi-statement)
-                    if upsert_statements:
-                        batch_query = "; ".join(upsert_statements)
-                        result = self._db.query("sqlscript", batch_query, is_command=True)
-                        logger.info(f"Bulk upserted {len(entity_nodes)} entity nodes using sqlscript")
-                        
-                        # Create MENTIONS relationships after bulk upsert (critical for flexible-graphrag)
-                        for node in entity_nodes:
-                            entity_type = self._determine_entity_type(node)
+                                        escaped_value = self._escape_string(str(v))
+                                    prop_assignments.append(f"{safe_k} = '{escaped_value}'")
+
+                        upsert_stmt = (
+                            f"UPDATE {entity_type} SET {', '.join(prop_assignments)}"
+                            f" UPSERT WHERE name = '{self._escape_string(normalized_name)}'"
+                        )
+                        logger.debug(f"SQL_ENTITY_PROCESSING: {upsert_stmt[:200]}")
+
+                        if len(upsert_stmt) <= 10000:
+                            self._db.query("sql", upsert_stmt, is_command=True)
+                            if has_embedding:
+                                self._update_embedding(entity_type, 'name', normalized_name,
+                                                       list(node.embedding))
+                            succeeded += 1
                             self._create_mentions_relationship_sql(node, entity_type)
-                    
-                except Exception as e:
-                    logger.warning(f"Bulk entity upsert failed, using individual operations: {e}")
-                    # Fallback to individual operations
-                    for node in entity_nodes:
+                        else:
+                            logger.debug(f"Statement too long for {normalized_name}, using individual upsert")
+                            self._upsert_entity_node(node)
+                            succeeded += 1
+
+                    except Exception as e:
+                        err_str = str(e)
+                        # Avoid logging enormous SQL with embedded 1536-dim vectors
+                        if len(err_str) > 300:
+                            err_str = err_str[:300] + "... [truncated]"
+                        logger.warning(f"SQL upsert failed for entity {normalized_name}, falling back: {err_str}")
                         try:
                             self._upsert_entity_node(node)
+                            succeeded += 1
                         except Exception as e2:
-                            logger.error(f"Failed to upsert entity node {node.name}: {e2}")
+                            e2_str = str(e2)
+                            if len(e2_str) > 300:
+                                e2_str = e2_str[:300] + "... [truncated]"
+                            logger.error(f"Failed to upsert entity node {node.name}: {e2_str}")
+
+                logger.info(f"Bulk upserted {succeeded}/{len(entity_nodes)} entity nodes")
             
-            # Bulk upsert chunk nodes using sqlscript language for multi-statement queries
+            # Upsert chunk nodes one statement at a time (same rationale as entity nodes above).
             if chunk_nodes:
+                # Phase 1: ensure TextChunk schema type and UNIQUE index exist
                 try:
-                    # Build multiple UPDATE ... UPSERT statements
-                    upsert_statements = []
-                    for node in chunk_nodes:
-                        # Ensure TextChunk type exists
-                        self._ensure_dynamic_type('TextChunk', 'VERTEX')
-                        
-                        # Build property assignments with proper escaping
+                    self._ensure_dynamic_type('TextChunk', 'VERTEX')
+                except Exception as schema_err:
+                    logger.warning(f"Could not ensure TextChunk type: {schema_err}")
+                try:
+                    self._ensure_index_for_upsert('TextChunk', 'id')
+                except Exception as idx_err:
+                    logger.debug(f"Index ensure skipped for TextChunk.id: {idx_err}")
+
+                # Phase 2: write each chunk individually
+                succeeded = 0
+                for node in chunk_nodes:
+                    try:
                         text_escaped = self._escape_string(node.text)
-                        prop_assignments = [f"id = '{self._escape_string(node.id)}'", f"text = '{text_escaped}'"]
-                        
-                        # Handle embedding separately to avoid SQL parsing issues with large JSON
+                        prop_assignments = [
+                            f"id = '{self._escape_string(node.id)}'",
+                            f"text = '{text_escaped}'"
+                        ]
+
+                        ref_doc_id = getattr(node, 'ref_doc_id', None)
+                        if ref_doc_id is None and node.properties:
+                            ref_doc_id = node.properties.get('ref_doc_id')
+                        if ref_doc_id:
+                            prop_assignments.append(f"ref_doc_id = '{self._escape_string(str(ref_doc_id))}'")
+
+                        # Embedding excluded from UPSERT — stored via _update_embedding()
                         has_embedding = hasattr(node, 'embedding') and node.embedding is not None
-                        if has_embedding:
-                            # Skip embedding in bulk operations to avoid SQL parsing errors
-                            logger.debug(f"Skipping embedding in bulk operation for chunk {node.id}")
-                        
+
                         if node.properties:
                             for k, v in node.properties.items():
-                                if k != 'embedding':
-                                    if isinstance(v, (list, dict)):
-                                        # Handle JSON data properly
-                                        json_str = json.dumps(v)
-                                        escaped_value = self._escape_string(json_str)
-                                    else:
-                                        # Handle string and other types
-                                        v_str = str(v)
-                                        escaped_value = self._escape_string(v_str)
-                                    prop_assignments.append(f"{k} = '{escaped_value}'")
-                        
-                        # Create UPDATE ... UPSERT statement
-                        upsert_stmt = f"UPDATE TextChunk SET {', '.join(prop_assignments)} UPSERT WHERE id = '{self._escape_string(node.id)}'"
-                        
-                        # Check statement length to avoid SQL parsing errors
-                        if len(upsert_stmt) <= 15000:  # Larger limit for text chunks
-                            upsert_statements.append(upsert_stmt)
+                                if k in ('embedding', 'ref_doc_id'):
+                                    continue
+                                self._ensure_property('TextChunk', k)
+                                safe_k = self._sql_identifier(k)
+                                if isinstance(v, (list, dict)):
+                                    escaped_value = self._escape_string(json.dumps(v))
+                                else:
+                                    escaped_value = self._escape_string(str(v))
+                                prop_assignments.append(f"{safe_k} = '{escaped_value}'")
+
+                        upsert_stmt = (
+                            f"UPDATE TextChunk SET {', '.join(prop_assignments)}"
+                            f" UPSERT WHERE id = '{self._escape_string(node.id)}'"
+                        )
+
+                        if len(upsert_stmt) <= 15000:
+                            self._db.query("sql", upsert_stmt, is_command=True)
+                            if has_embedding:
+                                self._update_embedding('TextChunk', 'id', node.id,
+                                                       list(node.embedding))
+                            succeeded += 1
                         else:
-                            logger.debug(f"Skipping bulk operation for chunk {node.id} due to statement length")
-                    
-                    # Execute as sqlscript (multi-statement)
-                    if upsert_statements:
-                        batch_query = "; ".join(upsert_statements)
-                        result = self._db.query("sqlscript", batch_query, is_command=True)
-                        logger.info(f"Bulk upserted {len(chunk_nodes)} chunk nodes using sqlscript")
-                    
-                except Exception as e:
-                    logger.warning(f"Bulk chunk upsert failed, using individual operations: {e}")
-                    # Fallback to individual operations
-                    for node in chunk_nodes:
+                            logger.debug(f"Statement too long for chunk {node.id}, using individual upsert")
+                            self._upsert_chunk_node(node)
+                            succeeded += 1
+
+                    except Exception as e:
+                        err_str = str(e)
+                        if len(err_str) > 300:
+                            err_str = err_str[:300] + "... [truncated]"
+                        logger.warning(f"SQL upsert failed for chunk {node.id}, falling back: {err_str}")
                         try:
                             self._upsert_chunk_node(node)
+                            succeeded += 1
                         except Exception as e2:
-                            logger.error(f"Failed to upsert chunk node {node.id}: {e2}")
+                            e2_str = str(e2)
+                            if len(e2_str) > 300:
+                                e2_str = e2_str[:300] + "... [truncated]"
+                            logger.error(f"Failed to upsert chunk node {node.id}: {e2_str}")
+
+                logger.info(f"Bulk upserted {succeeded}/{len(chunk_nodes)} chunk nodes")
             
             # Handle other nodes individually (no bulk operation available)
             for node in other_nodes:
@@ -962,7 +1170,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.error(f"Traceback: {traceback.format_exc()}")
 
     def upsert_relations(self, relations: List[Relation]) -> None:
-        """Insert or update relationships in the graph using v0.3.0+ bulk operations."""
+        """Insert or update relationships in the graph using v0.4.0+ bulk operations."""
         logger.info(f"RELATIONS: Upserting {len(relations)} relations")
         
         # Try bulk operations first for better performance
@@ -987,7 +1195,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         }
                         relation_data.append(data)
                     
-                    # Note: bulk_upsert_relations doesn't exist in v0.3.0, fall back to individual
+                    # Note: bulk_upsert_relations doesn't exist in v0.4.0, fall back to individual
                     logger.info(f"Processing {len(type_relations)} relations of type {rel_type} individually")
                     for relation in type_relations:
                         self._upsert_relation(relation)
@@ -1020,97 +1228,89 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> None:
-        """Delete nodes and relationships matching criteria using v0.3.0+ features."""
+        """Delete nodes and relationships matching criteria.
+
+        Fix 1: properties/entity_names branches now iterate over ALL vertex
+                 types returned by the schema, not just Entity and TextChunk.
+        Fix 2: ids branch searches by the logical 'id' / 'name' fields that
+                 LlamaIndex writes, not by ArcadeDB internal @rid values.
+        Fix 3: ref_doc_id is now stored on TextChunk (see _upsert_chunk_node),
+                 so delete(properties={'ref_doc_id': '...'}) works correctly.
+        """
         try:
+            all_vertex_types = self._get_all_vertex_types()
+
             if ids:
-                # Use bulk delete for IDs
-                try:
-                    ids_str = "', '".join(ids)
-                    # Delete from Entity first
-                    entity_deleted = self._db.bulk_delete(
-                        type_name="Entity",
-                        conditions=[f"@rid IN ['{ids_str}']"],
-                        batch_size=1000
-                    )
-                    # Delete from TextChunk
-                    chunk_deleted = self._db.bulk_delete(
-                        type_name="TextChunk", 
-                        conditions=[f"@rid IN ['{ids_str}']"],
-                        batch_size=1000
-                    )
-                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by IDs")
-                except (BulkOperationException, ValidationException) as e:
-                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
-                    # Fallback to traditional method
-                    ids_str = "', '".join(ids)
-                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE @rid IN ['{ids_str}']"
-                    self._db.query("sql", query, is_command=True)
+                # LlamaIndex logical IDs are stored as:
+                #   TextChunk: 'id' field
+                #   Entity/*:  'name' field
+                # They are NOT ArcadeDB internal @rid values.
+                total_deleted = 0
+                for node_id in ids:
+                    escaped = self._escape_string(node_id)
+                    for type_name in all_vertex_types:
+                        try:
+                            if type_name == 'TextChunk':
+                                condition = f"id = '{escaped}'"
+                            else:
+                                condition = f"name = '{escaped}' OR id = '{escaped}'"
+                            q = f"DELETE FROM {type_name} WHERE {condition}"
+                            self._db.query("sql", q, is_command=True)
+                            total_deleted += 1
+                        except Exception as e:
+                            logger.debug(f"Delete by id from {type_name} failed: {e}")
+                logger.info(f"Deleted nodes by logical IDs across {len(all_vertex_types)} types")
 
             elif entity_names:
-                # Use bulk delete for entity names
-                try:
-                    names_str = "', '".join(entity_names)
-                    # Delete from Entity first  
-                    entity_deleted = self._db.bulk_delete(
-                        type_name="Entity",
-                        conditions=[f"name IN ['{names_str}']"],
-                        batch_size=1000
-                    )
-                    # Delete from TextChunk (using id field)
-                    chunk_deleted = self._db.bulk_delete(
-                        type_name="TextChunk",
-                        conditions=[f"id IN ['{names_str}']"],
-                        batch_size=1000
-                    )
-                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by entity names")
-                except (BulkOperationException, ValidationException) as e:
-                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
-                    # Fallback to traditional method
-                    names_str = "', '".join(entity_names)
-                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE name IN ['{names_str}']"
-                    self._db.query("sql", query, is_command=True)
+                # Delete by entity name across all vertex types
+                total_deleted = 0
+                for type_name in all_vertex_types:
+                    try:
+                        escaped_names = [self._escape_string(n) for n in entity_names]
+                        names_list = "', '".join(escaped_names)
+                        if type_name == 'TextChunk':
+                            condition = f"id IN ['{names_list}']"
+                        else:
+                            condition = f"name IN ['{names_list}']"
+                        q = f"DELETE FROM {type_name} WHERE {condition}"
+                        self._db.query("sql", q, is_command=True)
+                        total_deleted += 1
+                    except Exception as e:
+                        logger.debug(f"Delete by name from {type_name} failed: {e}")
+                logger.info(f"Deleted entity names across {len(all_vertex_types)} types")
 
             elif properties:
-                # Build property conditions for bulk delete
-                where_conditions = []
+                # Build WHERE clause from properties dict
+                where_parts = []
                 for key, value in properties.items():
+                    safe_key = self._sql_identifier(key)
                     if isinstance(value, str):
-                        where_conditions.append(f"{key} = '{value}'")
+                        where_parts.append(f"{safe_key} = '{self._escape_string(value)}'")
                     else:
-                        where_conditions.append(f"{key} = {value}")
+                        where_parts.append(f"{safe_key} = {value}")
+                where_clause = " AND ".join(where_parts)
 
-                try:
-                    # Delete from Entity first
-                    entity_deleted = self._db.bulk_delete(
-                        type_name="Entity",
-                        conditions=where_conditions,
-                        batch_size=1000
-                    )
-                    # Delete from TextChunk
-                    chunk_deleted = self._db.bulk_delete(
-                        type_name="TextChunk",
-                        conditions=where_conditions,
-                        batch_size=1000
-                    )
-                    logger.info(f"Bulk deleted {entity_deleted + chunk_deleted} nodes by properties")
-                except (BulkOperationException, ValidationException) as e:
-                    logger.warning(f"Bulk delete failed, using traditional method: {e}")
-                    # Fallback to traditional method
-                    where_clause = " AND ".join(where_conditions)
-                    query = f"DELETE FROM (SELECT * FROM Entity UNION SELECT * FROM TextChunk) WHERE {where_clause}"
-                    self._db.query("sql", query, is_command=True)
+                total_deleted = 0
+                for type_name in all_vertex_types:
+                    try:
+                        q = f"DELETE FROM {type_name} WHERE {where_clause}"
+                        self._db.query("sql", q, is_command=True)
+                        total_deleted += 1
+                    except Exception as e:
+                        logger.debug(f"Delete by properties from {type_name} failed: {e}")
+                logger.info(f"Deleted by properties across {len(all_vertex_types)} types")
 
             if relation_names:
-                # Use safe_delete_all for relation types
                 for relation_name in relation_names:
                     try:
                         deleted_count = self._db.safe_delete_all(relation_name, batch_size=1000)
-                        logger.info(f"Safe deleted {deleted_count} relations of type {relation_name}")
-                    except (ValidationException, BulkOperationException) as e:
-                        logger.warning(f"Safe delete failed for {relation_name}, using traditional method: {e}")
-                        # Fallback to traditional method
-                        query = f"DELETE FROM {relation_name}"
-                        self._db.query("sql", query, is_command=True)
+                        logger.info(f"Deleted {deleted_count} relations of type {relation_name}")
+                    except Exception as e:
+                        logger.warning(f"safe_delete_all failed for {relation_name}, falling back: {e}")
+                        try:
+                            self._db.query("sql", f"DELETE FROM {relation_name}", is_command=True)
+                        except Exception as e2:
+                            logger.debug(f"Fallback delete for {relation_name} failed: {e2}")
 
         except Exception as e:
             logger.error(f"Failed to delete: {e}")
@@ -1122,10 +1322,17 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         """Execute a structured SQL query against the graph.
         
         This SQL-only version provides optimal performance for ArcadeDB operations.
+        DML statements (DELETE, INSERT, UPDATE, CREATE, DROP, TRUNCATE) are
+        automatically sent as commands (is_command=True) to satisfy ArcadeDB's
+        non-idempotent query requirement.
         """
         try:
-            # Execute SQL query (this is the SQL-only version)
-            results = self._db.query("sql", query)
+            # Detect DML/DDL statements that require is_command=True
+            query_upper = query.strip().upper()
+            is_command = query_upper.startswith((
+                'DELETE', 'INSERT', 'UPDATE', 'CREATE', 'DROP', 'TRUNCATE', 'ALTER'
+            ))
+            results = self._db.query("sql", query, is_command=is_command)
             return results
 
         except Exception as e:
@@ -1136,18 +1343,64 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def vector_query(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> Tuple[List[LabelledNode], List[float]]:
-        """Execute a vector similarity query.
-        
-        Note: Vector search is currently NOT supported in the arcadedb-python driver.
-        This method returns empty results gracefully to maintain interface compatibility.
+        """Execute a vector similarity search using ArcadeDB's LSM_VECTOR index.
+
+        Searches all known vertex types that have an embedding field and returns
+        the top-k most similar nodes together with their cosine distances.
+
+        Args:
+            query: VectorStoreQuery containing query_embedding and similarity_top_k.
+
+        Returns:
+            Tuple of (nodes, scores) where scores are cosine distances (lower = closer).
         """
         if not query.query_embedding:
             logger.debug("No query embedding provided for vector search")
             return [], []
-        
-        # Vector search is not supported in current arcadedb-python driver
-        logger.debug("Vector search is not supported in current arcadedb-python driver - returning empty results")
-        return [], []
+
+        top_k = query.similarity_top_k or 10
+        query_embedding = list(query.query_embedding)
+
+        # Search every vertex type that has been created with an embedding property
+        vertex_types = list(
+            {'Entity', 'TextChunk'} | self._discovered_vertex_types
+        )
+
+        all_results: List[Tuple[LabelledNode, float]] = []
+
+        for type_name in vertex_types:
+            try:
+                records = self._db.vector_search(
+                    type_name=type_name,
+                    embedding_field='embedding',
+                    query_embedding=query_embedding,
+                    top_k=top_k,
+                )
+                for record in records:
+                    try:
+                        node = self._result_to_node(record)
+                        # vectorNeighbors returns cosine *distance* (0=identical, 1=orthogonal).
+                        # VectorContextRetriever treats scores as *similarity* (higher = better),
+                        # so convert: similarity = 1.0 - distance.
+                        distance = float(record.get('distance', record.get('similarity_score', 1.0)))
+                        score = max(0.0, 1.0 - distance)
+                        all_results.append((node, score))
+                    except Exception as conv_err:
+                        logger.debug(f"Could not convert vector result to node: {conv_err}")
+            except Exception as e:
+                logger.debug(f"Vector search failed for type {type_name}: {e}")
+
+        if not all_results:
+            return [], []
+
+        # Sort by score descending (higher similarity = better match) and trim to top_k
+        all_results.sort(key=lambda x: x[1], reverse=True)
+        all_results = all_results[:top_k]
+
+        nodes = [r[0] for r in all_results]
+        scores = [r[1] for r in all_results]
+        logger.info(f"Vector query returned {len(nodes)} results across {len(vertex_types)} types")
+        return nodes, scores
 
     def get_schema(self, refresh: bool = False) -> Any:
         """Get the database schema in LlamaIndex-compatible format."""
@@ -1228,8 +1481,16 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
         if node_type == 'TextChunk':
             text = properties.pop('text', '')
+            # Use the logical 'id' field (chunk ID) not the ArcadeDB @rid.
+            # get_llama_nodes builds a map keyed by node.node_id and _add_source_text
+            # looks it up by triplet_source_id — both use the logical chunk ID, so
+            # using @rid here would cause a key mismatch and source text would never
+            # be attached to graph retrieval results.
+            # VectorContextRetriever also matches triplet node IDs against kg_ids
+            # (logical IDs from vector_query) — @rid would always miss, giving score=0.0.
+            logical_id = properties.get('id') or node_id
             return ChunkNode(
-                id_=node_id,
+                id_=logical_id,
                 text=text,
                 label=node_type,
                 properties=properties
@@ -1245,8 +1506,9 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _result_to_relation(self, result_data: Dict[str, Any]) -> Relation:
         """Convert query result to Relation."""
         label = result_data.get('@type', result_data.get('@class', 'RELATION'))
-        source_id = result_data.get('source_id', result_data.get('out', ''))
-        target_id = result_data.get('target_id', result_data.get('in', ''))
+        # ArcadeDB uses @out/@in for edge endpoints (system fields with @ prefix)
+        source_id = result_data.get('source_id', result_data.get('@out', result_data.get('out', '')))
+        target_id = result_data.get('target_id', result_data.get('@in',  result_data.get('in', '')))
 
         # Extract properties, excluding system fields
         properties = {
@@ -1289,22 +1551,22 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # Use ArcadeDB's native UPDATE ... UPSERT syntax for atomic upsert
         prop_assignments = [f"name = '{self._escape_string(normalized_name)}'"]
         
-        # Handle embedding if present - store as JSON for vector functionality
-        if hasattr(node, 'embedding') and node.embedding is not None:
-            embedding_json = json.dumps(node.embedding)
-            prop_assignments.append(f"embedding = '{embedding_json}'")
-            logger.debug(f"Storing embedding for entity {normalized_name} (dim: {len(node.embedding)})")
-        
-        # Add other properties
+        # Embedding is stored via a separate UPDATE after the UPSERT commits —
+        # the LSM_VECTOR index requires a native array literal which the SQL parser
+        # rejects inside a SET clause.
+        has_embedding = hasattr(node, 'embedding') and node.embedding is not None
+
+        # Add other properties, ensuring each is declared on the type first
         if node.properties:
             for k, v in node.properties.items():
-                if k != 'embedding':  # Skip embedding in properties, handled above
-                    # Skip very large properties that cause SQL parsing issues
+                if k != 'embedding':
                     v_str = str(v)
-                    if len(v_str) > 1000:  # Skip large properties
+                    if len(v_str) > 1000:
                         logger.debug(f"Skipping large property {k} for entity {normalized_name} (size: {len(v_str)})")
                         continue
-                    prop_assignments.append(f"{k} = '{self._escape_string(v_str)}'")
+                    self._ensure_property(entity_type, k)
+                    safe_k = self._sql_identifier(k)
+                    prop_assignments.append(f"{safe_k} = '{self._escape_string(v_str)}'")
         
         try:
             # Use ArcadeDB's native UPDATE ... UPSERT syntax (atomic operation)
@@ -1312,22 +1574,41 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             logger.debug(f"Executing {entity_type} UPSERT")
             result = self._db.query("sql", query, is_command=True)
             logger.debug(f"{entity_type} UPSERT result: {result}")
-            
-            # Embedding stored as hidden property for vector functionality
-            # Create MENTIONS relationship from chunk to entity (like FalkorDB)
+
+            if has_embedding:
+                self._update_embedding(entity_type, 'name', normalized_name,
+                                       list(node.embedding))
+
+            # Create MENTIONS relationship from chunk to entity
             self._create_mentions_relationship_sql(node, entity_type)
             
         except Exception as e:
-            logger.error(f"{entity_type} UPSERT failed: {e}")
-            logger.debug(f"Failed query was: [query details hidden]")
+            err_str = str(e)
+            if len(err_str) > 300:
+                err_str = err_str[:300] + "... [truncated]"
+            logger.warning(f"{entity_type} UPSERT failed for '{normalized_name}': {err_str}")
             # Fallback to basic insert if UPSERT fails
             try:
                 basic_query = f"INSERT INTO {entity_type} SET name = '{self._escape_string(normalized_name)}'"
                 logger.debug(f"Fallback basic insert for {normalized_name}")
                 self._db.query("sql", basic_query, is_command=True)
                 self._create_mentions_relationship_sql(node, entity_type)
+            except TransactionException as fallback_error:
+                detail = (fallback_error.detail or '').lower()
+                if "duplicate" in detail or "duplicated key" in detail:
+                    logger.debug(f"Entity '{normalized_name}' already exists in {entity_type} (duplicate key - ok)")
+                    self._create_mentions_relationship_sql(node, entity_type)
+                else:
+                    logger.warning(f"Insert fallback also failed for '{normalized_name}': {fallback_error}")
             except Exception as fallback_error:
-                logger.warning(f"Even basic insert failed for {normalized_name}: {fallback_error}")
+                fallback_str = str(fallback_error)
+                if "duplicate" in fallback_str.lower() or "duplicated key" in fallback_str.lower():
+                    logger.debug(f"Entity '{normalized_name}' already exists in {entity_type} (duplicate key - ok)")
+                    self._create_mentions_relationship_sql(node, entity_type)
+                else:
+                    if len(fallback_str) > 300:
+                        fallback_str = fallback_str[:300] + "... [truncated]"
+                    logger.warning(f"Insert fallback also failed for '{normalized_name}': {fallback_str}")
 
     def _upsert_chunk_node(self, node: ChunkNode) -> None:
         """Upsert a text chunk node."""
@@ -1342,23 +1623,30 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         
         # Use ArcadeDB's native UPDATE ... UPSERT syntax for atomic upsert
         prop_assignments = [f"id = '{self._escape_string(node.id)}'", f"text = '{text_escaped}'"]
-        
-        # Handle embedding if present - store as JSON for vector functionality
-        if hasattr(node, 'embedding') and node.embedding is not None:
-            embedding_json = json.dumps(node.embedding)
-            prop_assignments.append(f"embedding = '{embedding_json}'")
-            logger.debug(f"Storing embedding for chunk {node.id} (dim: {len(node.embedding)})")
-        
-        # Add other properties
+
+        # Persist ref_doc_id so delete(properties={'ref_doc_id': '...'}) works
+        ref_doc_id = getattr(node, 'ref_doc_id', None)
+        if ref_doc_id is None and node.properties:
+            ref_doc_id = node.properties.get('ref_doc_id')
+        if ref_doc_id:
+            prop_assignments.append(f"ref_doc_id = '{self._escape_string(str(ref_doc_id))}'")
+            logger.debug(f"Storing ref_doc_id '{ref_doc_id}' for chunk {node.id}")
+
+        # Embedding stored via separate UPDATE after UPSERT — same reason as entity nodes.
+        has_embedding = hasattr(node, 'embedding') and node.embedding is not None
+
+        # Add other properties, ensuring each is declared on the type first
         if node.properties:
             for k, v in node.properties.items():
-                if k != 'embedding':  # Skip embedding in properties, handled above
-                    # Skip very large properties that cause SQL parsing issues
-                    v_str = str(v)
-                    if len(v_str) > 1000:  # Skip large properties like _node_content
-                        logger.debug(f"Skipping large property {k} for chunk {node.id} (size: {len(v_str)})")
-                        continue
-                    prop_assignments.append(f"{k} = '{self._escape_string(v_str)}'")
+                if k in ('embedding', 'ref_doc_id'):
+                    continue
+                v_str = str(v)
+                if len(v_str) > 1000:
+                    logger.debug(f"Skipping large property {k} for chunk {node.id} (size: {len(v_str)})")
+                    continue
+                self._ensure_property('TextChunk', k)
+                safe_k = self._sql_identifier(k)
+                prop_assignments.append(f"{safe_k} = '{self._escape_string(v_str)}'")
         
         try:
             # Use ArcadeDB's native UPDATE ... UPSERT syntax (atomic operation)
@@ -1366,18 +1654,35 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             logger.debug(f"Executing TextChunk UPSERT")
             result = self._db.query("sql", query, is_command=True)
             logger.debug(f"TextChunk UPSERT result: {result}")
+
+            if has_embedding:
+                self._update_embedding('TextChunk', 'id', node.id, list(node.embedding))
             
             # Embedding stored as hidden property for vector functionality
         except Exception as e:
-            logger.error(f"TextChunk UPSERT failed: {e}")
-            logger.debug(f"Failed query was: [query details hidden]")
+            err_str = str(e)
+            if len(err_str) > 300:
+                err_str = err_str[:300] + "... [truncated]"
+            logger.warning(f"TextChunk UPSERT failed for '{node.id}': {err_str}")
             # Fallback to basic insert if UPSERT fails
             try:
                 basic_query = f"INSERT INTO TextChunk SET id = '{self._escape_string(node.id)}', text = '{text_escaped}'"
                 logger.debug(f"Fallback basic insert for chunk {node.id}")
                 self._db.query("sql", basic_query, is_command=True)
+            except TransactionException as fallback_error:
+                detail = (fallback_error.detail or '').lower()
+                if "duplicate" in detail or "duplicated key" in detail:
+                    logger.debug(f"Chunk '{node.id}' already exists in TextChunk (duplicate key - ok)")
+                else:
+                    logger.warning(f"Insert fallback also failed for chunk '{node.id}': {fallback_error}")
             except Exception as fallback_error:
-                logger.warning(f"Even basic chunk insert failed for {node.id}: {fallback_error}")
+                fallback_str = str(fallback_error)
+                if "duplicate" in fallback_str.lower() or "duplicated key" in fallback_str.lower():
+                    logger.debug(f"Chunk '{node.id}' already exists in TextChunk (duplicate key - ok)")
+                else:
+                    if len(fallback_str) > 300:
+                        fallback_str = fallback_str[:300] + "... [truncated]"
+                    logger.warning(f"Insert fallback also failed for chunk '{node.id}': {fallback_str}")
 
     def _upsert_generic_node(self, node: LabelledNode) -> None:
         """Upsert a generic labeled node."""
@@ -1400,7 +1705,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _upsert_relation(self, relation: Relation) -> None:
         """Upsert a relationship."""
         # LOG: What came from LLM
-        logger.info(f"LLM_RELATION_INPUT: label='{relation.label}', source='{relation.source_id}', target='{relation.target_id}', properties={list(relation.properties.keys()) if relation.properties else []}")
+        logger.debug(f"LLM_RELATION_INPUT: label='{relation.label}', source='{relation.source_id}', target='{relation.target_id}', properties={list(relation.properties.keys()) if relation.properties else []}")
         
         # Use proper ArcadeDB CREATE EDGE syntax from documentation
         properties_str = self._properties_to_sql_string(relation.properties)
@@ -1413,19 +1718,17 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         normalized_source_id = self._normalize_and_deduplicate_entity(relation.source_id) if relation.source_id else relation.source_id
         normalized_target_id = self._normalize_and_deduplicate_entity(relation.target_id) if relation.target_id else relation.target_id
         
-        logger.info(f"SQL_RELATION: source '{relation.source_id}' -> normalized '{normalized_source_id}'")
-        logger.info(f"SQL_RELATION: target '{relation.target_id}' -> normalized '{normalized_target_id}'")
+        logger.debug(f"SQL_RELATION: source '{relation.source_id}' -> normalized '{normalized_source_id}'")
+        logger.debug(f"SQL_RELATION: target '{relation.target_id}' -> normalized '{normalized_target_id}'")
         
         # Create edge type if it doesn't exist (dynamic schema)
         self._ensure_dynamic_type(relation.label, 'EDGE')
         
         # Use reliable individual query approach
         try:
-            # List of vertex types to search - include discovered dynamic types (avoid duplicates)
-            # Use essential types + discovered dynamic types instead of hard-coded list
-            base_vertex_types = ['Entity', 'TextChunk']  # Essential types always present
-            all_vertex_types = set(base_vertex_types) | self._discovered_vertex_types
-            vertex_types = list(all_vertex_types)
+            # Query the live schema so pre-existing types (PERSON, ORGANIZATION, etc.)
+            # are always included, even if they weren't created in this session.
+            vertex_types = self._get_all_vertex_types()
             
             logger.debug(f"FALLBACK: Searching for relation entities in types: {vertex_types}")
             
@@ -1477,7 +1780,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             
             logger.debug(f"Executing fallback CREATE EDGE: {query}")
             result = self._db.query("sql", query, is_command=True)
-            logger.info(f"SQL_FALLBACK_SUCCESS: Created {relation.label} edge from {source_rid} to {target_rid}")
+            logger.debug(f"SQL_FALLBACK_SUCCESS: Created {relation.label} edge from {source_rid} to {target_rid}")
             
         except Exception as fallback_error:
             logger.error(f"Both SQL MATCH and fallback failed: {fallback_error}")
@@ -1501,9 +1804,20 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             else:
                 value_str = str(value)
 
-            items.append(f"{key} = {value_str}")
+            safe_key = self._sql_identifier(key)
+            items.append(f"{safe_key} = {value_str}")
 
         return ", ".join(items)
+
+    @staticmethod
+    def _sql_identifier(name: str) -> str:
+        """Return a safely-quoted ArcadeDB SQL identifier.
+
+        Property names that contain spaces (e.g. 'modified at') must be
+        wrapped in backticks, exactly like MySQL quoted identifiers.
+        Names without spaces are returned unchanged.
+        """
+        return f"`{name}`" if ' ' in name else name
 
     def _escape_string(self, text: str) -> str:
         """Escape string for ArcadeDB SQL queries using backslash escaping.
@@ -1609,8 +1923,9 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             
             chunk_rid = chunk_result[0]['@rid']
             
-            # Find the entity
-            entity_query = f"SELECT @rid FROM {entity_type} WHERE name = '{self._escape_string(entity_node.name)}' LIMIT 1"
+            # Find the entity using the normalized name (which is what was actually stored)
+            normalized_entity_name = self._normalize_and_deduplicate_entity(entity_node.name)
+            entity_query = f"SELECT @rid FROM {entity_type} WHERE name = '{self._escape_string(normalized_entity_name)}' LIMIT 1"
             entity_result = self._db.query("sql", entity_query)
             
             if not entity_result or len(entity_result) == 0:
@@ -1665,18 +1980,18 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             
             # Validate it's a reasonable vertex type name (alphanumeric + underscore)
             if vertex_type.replace('_', '').isalnum() and len(vertex_type) > 0:
-                logger.info(f"ENTITY_TYPE_DETECTION: Using label '{vertex_type}' for entity '{node.name}' (from PathExtractor/LLM)")
+                logger.debug(f"ENTITY_TYPE_DETECTION: Using label '{vertex_type}' for entity '{node.name}' (from PathExtractor/LLM)")
                 return vertex_type
         
         # PRIORITY 2: Fallback to pattern-based classification
-        entity_name = node.name.lower()
-        classified_type = self._classify_entity_by_patterns(entity_name)
+        # Pass the original name so all-caps detection works correctly
+        classified_type = self._classify_entity_by_patterns(node.name)
         if classified_type != 'Entity':
-            logger.info(f"ENTITY_TYPE_DETECTION: Using pattern-based type '{classified_type}' for entity '{node.name}' (fallback classification)")
+            logger.debug(f"ENTITY_TYPE_DETECTION: Using pattern-based type '{classified_type}' for entity '{node.name}' (fallback classification)")
             return classified_type
         
         # PRIORITY 3: Generic fallback
-        logger.info(f"ENTITY_TYPE_DETECTION: Using generic 'Entity' type for '{node.name}' (no specific classification found)")
+        logger.debug(f"ENTITY_TYPE_DETECTION: Using generic 'Entity' type for '{node.name}' (no specific classification found)")
         return 'Entity'
     
     def _classify_entity_by_patterns(self, entity_name: str) -> str:
@@ -1689,6 +2004,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         """
         name_lower = entity_name.lower()
         words = name_lower.split()
+        original_words = entity_name.split()
         
         # Organization patterns
         org_suffixes = ['corp', 'inc', 'ltd', 'llc', 'company', 'co', 'corporation', 
@@ -1704,15 +2020,10 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         if any(org_type in name_lower for org_type in org_types):
             return 'ORGANIZATION'
         
-        # All caps acronyms are often organizations (NASA, IBM, SAP)
-        if len(words) == 1 and entity_name.isupper() and len(entity_name) >= 2:
+        # All-caps single word: acronym organizations (IBM, SAP, EMC, NASA)
+        # Check against the original-case name, not the lowercased version
+        if len(original_words) == 1 and entity_name.isupper() and len(entity_name) >= 2:
             return 'ORGANIZATION'
-        
-        # Person name patterns
-        if len(words) == 2:
-            # Two words, both capitalized, likely a person name
-            if all(word[0].isupper() for word in words if word):
-                return 'PERSON'
         
         # Technology/specification patterns
         tech_indicators = ['specification', 'standard', 'protocol', 'api', 'system', 

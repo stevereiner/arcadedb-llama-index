@@ -14,14 +14,14 @@ try:
     from llama_index.embeddings.openai import OpenAIEmbedding
     DEPENDENCIES_AVAILABLE = True
 except ImportError as e:
-    print(f"⚠️ Import error: {e}")
+    print(f"Import error: {e}")
     DEPENDENCIES_AVAILABLE = False
 
 def test_final_integration():
     if not DEPENDENCIES_AVAILABLE:
         pytest.skip("Required dependencies not available (OpenAI, LlamaIndex components)")
     
-    print("🚀 Testing final ArcadeDB integration with corrected syntax...")
+    print("Testing final ArcadeDB integration with corrected syntax...")
     
     # Initialize with corrected syntax
     store = ArcadeDBPropertyGraphStore(
@@ -35,9 +35,8 @@ def test_final_integration():
         embedding_dimension=1536
     )
     
-    # Test content - accurate information about John Newton and CMIS (circa 2008)
     test_content = """
-    John Newton was Chairman and CTO of Alfresco at the time of CMIS development. He was instrumental in the creation of CMIS technology.
+    John Newton was Chairman and CTO of Alfresco at the time of CMIS development.
     CMIS (Content Management Interoperability Services) is a content management interoperability services standard.
     The CMIS draft specification is backed by multiple major organizations including Alfresco, EMC, IBM, Microsoft, OpenText, Oracle and SAP.
     The CMIS standard enables interoperability between different content management systems and was developed by OASIS.
@@ -56,7 +55,7 @@ def test_final_integration():
         llm = OpenAI(model="gpt-4o-mini", temperature=0.1)
         embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
         
-        print("📊 Creating PropertyGraphIndex...")
+        print("Creating PropertyGraphIndex...")
         index = PropertyGraphIndex.from_documents(
             documents,
             llm=llm,
@@ -65,22 +64,28 @@ def test_final_integration():
             show_progress=True,
         )
         
-        print("✅ SUCCESS: PropertyGraphIndex created successfully!")
-        
+        print("SUCCESS: PropertyGraphIndex created successfully!")
+
         # Test queries
         all_nodes = store.get()
         all_relations = store.get_triplets()
-        
-        print(f"📈 Results:")
-        print(f"  - Total nodes: {len(all_nodes)}")
-        print(f"  - Total relationships: {len(all_relations)}")
-        print(f"  - Database: final_test")
-        print(f"  - Mode: SQL with native UPSERT")
+
+        print(f"Total nodes: {len(all_nodes)}")
+        # Group nodes by label/type
+        from collections import defaultdict
+        by_type = defaultdict(list)
+        for node in all_nodes:
+            by_type[node.label].append(getattr(node, 'name', getattr(node, 'id', '?')))
+        for label, names in sorted(by_type.items()):
+            print(f"  {label}: {names}")
+
+        print(f"Total relationships: {len(all_relations)}")
+        for triplet in all_relations:
+            print(f"  {triplet[0]} --[{triplet[1]}]--> {triplet[2]}")
         
         assert True  # Test passes
         
     except Exception as e:
-        print(f"❌ ERROR: {e}")
         import traceback
         traceback.print_exc()
         assert False, f"Integration test failed: {e}"
@@ -93,8 +98,4 @@ def test_final_integration():
             pass
 
 if __name__ == "__main__":
-    success = test_final_integration()
-    if success:
-        print("🎉 FINAL INTEGRATION TEST PASSED!")
-    else:
-        print("💥 FINAL INTEGRATION TEST FAILED!")
+    test_final_integration()

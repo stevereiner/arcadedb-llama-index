@@ -34,14 +34,9 @@ def test_auth_combinations():
         try:
             print(f"\n🔑 Trying {username}/{password}...")
             
-            payload = {
-                "command": "SELECT 1 as test",
-                "language": "sql"
-            }
-            
-            response = requests.post(
-                "http://localhost:2480/api/v1/query/flexible_graphrag",
-                json=payload,
+            # Use the server-level endpoint to list databases — no specific DB required
+            response = requests.get(
+                "http://localhost:2480/api/v1/server",
                 auth=(username, password),
                 timeout=5
             )

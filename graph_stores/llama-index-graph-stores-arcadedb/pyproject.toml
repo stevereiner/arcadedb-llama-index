@@ -26,11 +26,9 @@ dev = [
 
 [project]
 name = "llama-index-graph-stores-arcadedb"
-version = "0.3.1"
+version = "0.4.0"
 description = "LlamaIndex Graph Stores integration for ArcadeDB - Multi-Model Database with Graph, Document, Key-Value, Vector, and Time-Series support"
 authors = [
-    {name = "Adams Rosales"},
-    {name = "ExtReMLapin"},
     {name = "Steve Reiner"},
 ]
 maintainers = [
@@ -69,8 +67,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "llama-index-core>=0.13.0,<0.15",
-    "arcadedb-python>=0.3.1",
+    "llama-index-core>=0.13.0",
+    "arcadedb-python>=0.4.0",
 ]
 
 [project.optional-dependencies]

@@ -143,6 +143,7 @@ cython_debug/
 
 # Memory bank files (keep local, don't commit)
 memory-bank/
+.cursor/
 
 # ArcadeDB data
 arcadedb_data/
