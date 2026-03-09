@@ -148,6 +148,10 @@ memory-bank/
 # ArcadeDB data
 arcadedb_data/
 
+# ArcadeDB embedded server database and log folders
+databases/
+log/
+
 # Docker volumes
 volumes/
 

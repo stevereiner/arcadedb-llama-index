@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 from llama_index.core.graph_stores.types import GraphStore
@@ -8,16 +9,21 @@ class TestArcadeDBGraphStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Setup method called once for the entire test class."""
-        # Reuse existing ArcadeDB server from docker-compose but use different database
-        # This avoids port conflicts and is more efficient
-        
-        # Set up the graph store using existing server with unique database name
+        import requests
+        port = int(os.environ.get("ARCADEDB_PORT", "2481"))
+        try:
+            requests.get(f"http://localhost:{port}", timeout=2)
+        except Exception:
+            raise unittest.SkipTest(
+                f"ArcadeDB test container not available on port {port} "
+                "(started by conftest.py session fixture)"
+            )
         cls.graph_store = ArcadeDBGraphStore(
-            host="localhost",
-            port=2480,  # Use existing docker-compose port
-            username="root",
-            password="playwithdata",
-            database=f"graph_test_{int(time.time())}"  # Unique database name
+            host=os.environ.get("ARCADEDB_HOST", "localhost"),
+            port=port,
+            username=os.environ.get("ARCADEDB_USERNAME", "root"),
+            password=os.environ.get("ARCADEDB_PASSWORD", "playwithdata"),
+            database=f"graph_test_{int(time.time())}"
         )
 
     @classmethod

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-07] - 0.4.1 Release: embedded ArcadeDB in-process mode
+
+### Added
+- **`_db_adapter.py`** — adapter layer (`RemoteAdapter`, `EmbeddedAdapter`) unifying remote HTTP and embedded in-process access; handles Java→Python result conversion and JUL log suppression
+- **`arcadedb_property_graph.py`** — `mode="embedded"` support with `db_path`, `embedded_server`, `embedded_server_port`, `embedded_server_password` params and `embedded_server_url` property; `faulthandler` management around JPype import
+- **`__init__.py`** — exports `EMBEDDED_AVAILABLE`
+- **`examples/embedded_server.py`** — script to start Studio UI against an existing embedded database
+- **`base.py` (`ArcadeDBGraphStore`)** — embedded mode support added (`mode`, `db_path`, `embedded_server` params) via the same adapter pattern as `ArcadeDBPropertyGraphStore`
+- **4 new test files** mirroring the remote integration suite for embedded mode: `test_arcadedb_embedded_integration.py`, `test_pg_stores_arcadedb_embedded.py`, `test_graph_stores_arcadedb_embedded.py`, `test_final_integration_embedded.py`; embedded tests share one store/JVM per module (no reconnect per test)
+- **`conftest.py`** — session-scoped Docker container startup/teardown on port 2481 (independent of any user container on 2480); `pytest_unconfigure` calls `os._exit(0)` to prevent JPype JVM thread hang after tests
+- **`pytest.ini`** — `addopts = -p no:faulthandler` to suppress JPype signal-handler console dumps
+
+### Fixed
+- **Embedded vector search** (`_db_adapter.py`) — use SQL `vectorNeighbors()` instead of direct Java index access; eliminates `FALLBACK: Could not read vectors from pages` and `Invalid position` errors
+- **Java String Pydantic errors** (`_db_adapter.py`, `arcadedb_property_graph.py`) — coerce all Java `String` values to Python `str` before passing to LlamaIndex node constructors
+- **Graph triplets missing in embedded mode** (`arcadedb_property_graph.py`) — `get_rel_map` switched to `SELECT expand(bothE())` for reliable edge traversal
+- **`SchemaException` not imported** (`arcadedb_property_graph.py`) — was caught but never imported; added to `arcadedb_python` import block
+
+
+### Changed
+- **`requirements.txt`** / **`pyproject.toml`** — `arcadedb-embedded>=26.2.1` added as commented-out / optional (`[embedded]`) dependency
+- **`README.md`** — rewritten with remote vs embedded modes, installation, usage examples, and full parameter table
+- **Trace-level log lines demoted from INFO to DEBUG** (`arcadedb_property_graph.py`, `_db_adapter.py`)
+### Dependencies
+
+- Package version `0.4.0` → `0.4.1`
+- `arcadedb-embedded>=26.2.1` optional (package version = bundled ArcadeDB version; ~95 MB installed)
+
+---
+
 ## [2026-03-02] - 0.4.0 Release: native vector support, fixed delete nodes, added tests
 
 ### Added

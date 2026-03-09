@@ -3,29 +3,36 @@
 This module provides a PropertyGraphStore implementation for ArcadeDB,
 enabling LlamaIndex to work with ArcadeDB as a graph database backend.
 
+Two connection modes are supported:
+
+* ``mode="remote"`` (default) — connects to a running ArcadeDB server via
+  HTTP/REST using the ``arcadedb-python`` package.
+* ``mode="embedded"`` — runs ArcadeDB in-process via the
+  ``arcadedb-embedded`` package (no server required).  Pass ``db_path``
+  to specify where the database files are stored on disk.
+
 Requirements:
-- arcadedb_python library: pip install arcadedb-python
-- LlamaIndex core with PropertyGraphStore interface
+- Remote mode: pip install arcadedb-python>=0.4.0
+- Embedded mode: pip install arcadedb-embedded  (large ~68 MB wheel)
 
-Example usage:
+Example usage (remote — existing behaviour):
     from llama_index.graph_stores.arcadedb import ArcadeDBPropertyGraphStore
-    from llama_index.core import PropertyGraphIndex
 
-    # Initialize the graph store
     graph_store = ArcadeDBPropertyGraphStore(
         host="localhost",
         port=2480,
-        username="root", 
+        username="root",
         password="playwithdata",
         database="graph_db",
-        embedding_dimension=1536  # Optional: OpenAI ada-002 (use 384 for Ollama all-MiniLM-L6-v2)
+        embedding_dimension=1536,
     )
 
-    # Create a property graph index
-    index = PropertyGraphIndex.from_documents(
-        documents,
-        property_graph_store=graph_store,
-        show_progress=True
+Example usage (embedded — no server required):
+    graph_store = ArcadeDBPropertyGraphStore(
+        mode="embedded",
+        db_path="./my_graph_db",
+        database="graph_db",
+        embedding_dimension=384,
     )
 """
 
@@ -39,6 +46,7 @@ try:
     from arcadedb_python import (
         ArcadeDBException,
         QueryParsingException,
+        SchemaException,
         ValidationException,
         BulkOperationException,
         TransactionException,
@@ -50,6 +58,26 @@ except ImportError as e:
         "Install it with: pip install arcadedb-python>=0.4.0"
     ) from e
 
+# arcadedb-embedded is optional — only imported when mode="embedded".
+# Temporarily disable faulthandler around the import: JPype/JVM uses SIGSEGV
+# signals internally during JVM startup and faulthandler would otherwise print
+# spurious "Windows fatal exception: access violation" dumps to the console.
+# If the import succeeds, faulthandler stays disabled for the process lifetime
+# since the JVM may start at any point during embedded usage.
+# If the import fails (package not installed), faulthandler is restored.
+import faulthandler
+_faulthandler_was_enabled = faulthandler.is_enabled()
+faulthandler.disable()
+
+try:
+    import arcadedb_embedded as _arcadedb_embedded
+    _EMBEDDED_AVAILABLE = True
+except ImportError:
+    _arcadedb_embedded = None  # type: ignore[assignment]
+    _EMBEDDED_AVAILABLE = False
+    if _faulthandler_was_enabled:
+        faulthandler.enable()
+
 from llama_index.core.graph_stores.types import (
     PropertyGraphStore,
     LabelledNode,
@@ -60,9 +88,13 @@ from llama_index.core.graph_stores.types import (
 )
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
+from llama_index.graph_stores.arcadedb._db_adapter import (
+    RemoteAdapter,
+    EmbeddedAdapter,
+    build_embedded_adapter,
+)
+
 logger = logging.getLogger(__name__)
-
-
 
 
 class ArcadeDBPropertyGraphStore(PropertyGraphStore):
@@ -70,24 +102,54 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
     This class implements the PropertyGraphStore interface for ArcadeDB using native SQL,
     providing optimal performance for graph operations and full vector search capabilities.
-    
-    Uses ArcadeDB's native SQL engine with graph traversal patterns for reliable,
-    high-performance graph operations.
+
+    Supports two connection modes:
+
+    * ``mode="remote"`` (default) — connects to a running ArcadeDB server via
+      HTTP/REST.  Requires ``host``, ``port``, ``username``, ``password``.
+    * ``mode="embedded"`` — runs ArcadeDB in-process (no server needed).
+      Requires the ``arcadedb-embedded`` package.  Pass ``db_path`` to control
+      where the database files are stored on disk.
+
+      Optionally set ``embedded_server=True`` to start a full embedded HTTP
+      server.  The server is the sole owner of the database files (preventing
+      file-lock conflicts), exposes the ArcadeDB HTTP REST API, and serves
+      the Studio web UI where you can switch between **all databases** under
+      ``db_path`` using the Studio database picker.
 
     Args:
-        host: ArcadeDB server host (default: "localhost")
-        port: ArcadeDB server port (default: 2480)
-        username: Database username (default: "root")
-        password: Database password (default: "password")
-        database: Database name (default: "graph")
-        create_database_if_not_exists: Whether to create database if it doesn't exist (default: True)
-        include_basic_schema: Whether to include basic entity types beyond core types (default: True)
+        mode: Connection mode — ``"remote"`` (default) or ``"embedded"``.
+        db_path: Root directory for embedded database files.  Required when
+            ``mode="embedded"``.  Individual databases live at
+            ``<db_path>/<database>/``.  Ignored in remote mode.
+        host: ArcadeDB server host (remote mode, default: "localhost")
+        port: ArcadeDB server port (remote mode, default: 2480)
+        username: Database username (remote mode, default: "root")
+        password: Database password (remote mode, default: "playwithdata")
+        database: Database name to open or create (default: "graph")
+        create_database_if_not_exists: Create the database when it does not
+            exist (default: True)
+        include_basic_schema: Include PERSON, ORGANIZATION, LOCATION, PLACE
+            vertex types beyond the core Entity/TextChunk types (default: True)
         embedding_dimension: Optional dimension for vector embeddings
-        **kwargs: Additional arguments
+        embedded_server: Embedded mode only.  When ``True``, start the
+            built-in HTTP server.  The server becomes the *sole owner* of the
+            database files (no file-lock conflicts), exposes the REST API at
+            ``http://localhost:<embedded_server_port>/api/v1/``, and serves
+            Studio at ``http://localhost:<embedded_server_port>/`` where all
+            databases under ``db_path`` are selectable (default: False).
+        embedded_server_port: HTTP port for the embedded server (default: 2480).
+            Ignored when ``embedded_server=False`` or in remote mode.
+        embedded_server_password: Root password for the embedded server.  When
+            ``None`` the ArcadeDB default (insecure) credential is used.
+            Ignored when ``embedded_server=False`` or in remote mode.
+        **kwargs: Additional arguments (ignored)
     """
 
     def __init__(
         self,
+        mode: str = "remote",
+        db_path: Optional[str] = None,
         host: str = "localhost",
         port: int = 2480,
         username: str = "root",
@@ -96,15 +158,23 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         create_database_if_not_exists: bool = True,
         include_basic_schema: bool = True,
         embedding_dimension: Optional[int] = None,
+        embedded_server: bool = False,
+        embedded_server_port: int = 2480,
+        embedded_server_password: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the ArcadeDB Property Graph Store.
-        
+
         Schema Creation:
         - Always creates: Entity, TextChunk (vertex types) + MENTIONS (edge type)
-        - include_basic_schema=True: Also creates PERSON, ORGANIZATION, LOCATION, PLACE vertex types
-        - include_basic_schema=False: Only creates core types, lets LlamaIndex handle schema dynamically
+        - include_basic_schema=True: Also creates PERSON, ORGANIZATION, LOCATION, PLACE
+        - include_basic_schema=False: Only creates core types
         """
+        if mode not in ("remote", "embedded"):
+            raise ValueError(f"mode must be 'remote' or 'embedded', got {mode!r}")
+
+        self.mode = mode
+        self.db_path = db_path
         self.host = host
         self.port = port
         self.username = username
@@ -112,7 +182,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         self.database = database
         self.include_basic_schema = include_basic_schema
         self.embedding_dimension = embedding_dimension
-        
+
         # Track dynamically discovered schema
         self._discovered_vertex_types = set()
         self._discovered_edge_types = set()
@@ -120,59 +190,146 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # so _ensure_property() skips redundant CREATE PROPERTY calls.
         self._known_properties: set = set()
 
-        # Initialize ArcadeDB client with the FIXED version
+        if mode == "embedded":
+            self._init_embedded(
+                db_path,
+                database,
+                create_database_if_not_exists,
+                embedded_server=embedded_server,
+                embedded_server_port=embedded_server_port,
+                embedded_server_password=embedded_server_password,
+            )
+        else:
+            self._init_remote(host, port, username, password, database, create_database_if_not_exists)
+
+        # Set PropertyGraphStore capabilities
+        self.supports_structured_queries = True
+        self.supports_vector_queries = True
+
+        # Initialize schema with proper error handling
+        try:
+            self._ensure_schema()
+            logger.info("Schema initialization completed (%s mode)", mode)
+        except Exception as e:
+            logger.error("Failed to initialize schema: %s", e)
+            raise
+
+    # ------------------------------------------------------------------
+    # Connection helpers
+    # ------------------------------------------------------------------
+
+    def _init_remote(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        database: str,
+        create_if_not_exists: bool,
+    ) -> None:
+        """Set up the remote HTTP/REST connection via arcadedb-python."""
         try:
             self._client = SyncClient(
                 host=host,
                 port=port,
                 username=username,
                 password=password,
-                content_type="application/json"
+                content_type="application/json",
             )
-            logger.info(f"Initialized ArcadeDB client for {host}:{port}")
+            logger.info("Initialized ArcadeDB remote client for %s:%s", host, port)
         except Exception as e:
-            logger.error(f"Failed to initialize ArcadeDB client: {e}")
+            logger.error("Failed to initialize ArcadeDB remote client: %s", e)
             raise
 
-        # Connect to or create database using proper pattern
         try:
             if not DatabaseDao.exists(self._client, database):
-                if create_database_if_not_exists:
-                    logger.info(f"Database {database} does not exist, creating...")
-                    self._db = DatabaseDao.create(self._client, database)
-                    logger.info(f"Created database: {database}")
+                if create_if_not_exists:
+                    logger.info("Database %s does not exist, creating...", database)
+                    dao = DatabaseDao.create(self._client, database)
+                    logger.info("Created database: %s", database)
                 else:
-                    logger.error(f"Database {database} does not exist and create_database_if_not_exists=False")
                     raise Exception(f"Database {database} does not exist")
             else:
-                logger.info(f"Database {database} exists, connecting...")
-                self._db = DatabaseDao(self._client, database)
-                logger.info(f"Connected to existing database: {database}")
-            
-            # Test the connection with a simple query
+                logger.info("Database %s exists, connecting...", database)
+                dao = DatabaseDao(self._client, database)
+                logger.info("Connected to existing database: %s", database)
+
+            self._db = RemoteAdapter(dao)
+
             test_result = self._db.query("sql", "SELECT 1 as test")
-            logger.info(f"Database connection test successful: {test_result}")
-            
+            logger.info("Remote connection test successful: %s", test_result)
+
         except Exception as e:
-            logger.error(f"Database connection/creation failed: {e}")
+            logger.error("Remote database connection/creation failed: %s", e)
             raise
 
-        # Set PropertyGraphStore capabilities
-        self.supports_structured_queries = True
-        self.supports_vector_queries = True  # We support vector queries via manual similarity
+    def _init_embedded(
+        self,
+        db_path: Optional[str],
+        database: str,
+        create_if_not_exists: bool,
+        *,
+        embedded_server: bool = False,
+        embedded_server_port: int = 2480,
+        embedded_server_password: Optional[str] = None,
+    ) -> None:
+        """Set up an in-process embedded ArcadeDB connection.
 
-        # Initialize schema with proper error handling
+        File-lock safety: ArcadeDB allows only one Java handle on a database
+        directory at a time.  When ``embedded_server=False`` we open the
+        database via ``DatabaseFactory`` directly.  When ``embedded_server=True``
+        the embedded HTTP server becomes the *sole owner* of the files and we
+        obtain the ``Database`` handle back from the server — the two paths are
+        never mixed.  All of this logic lives in ``build_embedded_adapter()``.
+        """
+        if not _EMBEDDED_AVAILABLE:
+            raise ImportError(
+                "arcadedb-embedded is required for embedded mode. "
+                "Install it with: pip install arcadedb-embedded"
+            )
+        if not db_path:
+            raise ValueError(
+                "db_path must be provided when using mode='embedded'. "
+                "Example: db_path='./my_graph_db'"
+            )
+
         try:
-            self._ensure_schema()
-            logger.info(f"Schema initialization completed for {host}:{port}")
+            self._db = build_embedded_adapter(
+                db_path,
+                database,
+                create_if_not_exists,
+                embedded_server=embedded_server,
+                embedded_server_port=embedded_server_port,
+                embedded_server_password=embedded_server_password,
+            )
+
+            if embedded_server and self._db.embedded_server_url:
+                logger.info(
+                    "Embedded server running — Studio/HTTP at %s  (all DBs visible in Studio picker)", self._db.embedded_server_url
+                )
+
+            test_result = self._db.query("sql", "SELECT 1 as test")
+            logger.info("Embedded connection test successful: %s", test_result)
+
         except Exception as e:
-            logger.error(f"Failed to initialize schema: {e}")
+            logger.error("Embedded database init failed: %s", e)
             raise
 
     @property
     def client(self) -> Any:
-        """Get the database client."""
+        """Get the underlying database adapter (``RemoteAdapter`` or ``EmbeddedAdapter``)."""
         return self._db
+
+    @property
+    def embedded_server_url(self) -> Optional[str]:
+        """URL of the embedded Studio web UI, or ``None``.
+
+        Only populated in ``mode="embedded"`` when ``embedded_server=True``.
+        Example: ``"http://localhost:2480/"``
+        """
+        if self.mode == "embedded" and hasattr(self._db, "embedded_server_url"):
+            return self._db.embedded_server_url
+        return None
 
     def _ensure_schema(self) -> None:
         """Ensure basic schema exists for nodes and relationships."""
@@ -181,8 +338,8 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             existing_types = set()
             try:
                 result = self._db.query("sql", "SELECT name FROM schema:types")
-                logger.info(f"Raw schema query result: {result}")
-                logger.info(f"Result type: {type(result)}")
+                logger.debug(f"Raw schema query result: {result}")
+                logger.debug(f"Result type: {type(result)}")
                 
                 # Handle ArcadeDB response format: {"result": {"records": [{"name": "TypeName"}]}}
                 existing_types = set()
@@ -200,7 +357,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         if isinstance(record, dict) and 'name' in record:
                             existing_types.add(record['name'])
                 
-                logger.info(f"Existing types: {existing_types}")
+                logger.debug(f"Existing types: {existing_types}")
             except Exception as e:
                 logger.warning(f"Could not check existing types: {e}")
                 existing_types = set()
@@ -291,7 +448,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             # Verify the schema was created
             try:
                 result = self._db.query("sql", "SELECT name FROM schema:types")
-                logger.info(f"Verification query result: {result}")
+                logger.debug(f"Verification query result: {result}")
                 # Handle ArcadeDB response format: {"result": {"records": [{"name": "TypeName"}]}}
                 verified_types = []
                 
@@ -301,7 +458,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         records = result_data['records']
                         verified_types = [record['name'] for record in records if isinstance(record, dict) and 'name' in record]
                 
-                logger.info(f"Verified types exist: {verified_types}")
+                logger.debug(f"Verified types exist: {verified_types}")
                 
                 # Check if critical types exist - fix the false warning
                 critical_types = ['Entity', 'TextChunk']
@@ -491,11 +648,12 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _ensure_vector_index(self, type_name: str, embedding_field: str, dimensions: int) -> None:
         """Create an LSM_VECTOR index on the embedding field if it doesn't already exist."""
         import logging as _logging
-        # The arcadedb-python SyncClient logs every non-2xx response at ERROR level
-        # before raising.  Temporarily silence it so "already exists" isn't noisy.
+        # In remote mode the arcadedb-python SyncClient logs every non-2xx response at
+        # ERROR level before raising.  Temporarily silence it so "already exists" isn't noisy.
         _driver_logger = _logging.getLogger('arcadedb_python.api.sync')
         _orig_level = _driver_logger.level
-        _driver_logger.setLevel(_logging.CRITICAL)
+        if self.mode == "remote":
+            _driver_logger.setLevel(_logging.CRITICAL)
         try:
             self._db.create_vector_index(type_name, embedding_field, dimensions)
             logger.debug(f"Created LSM_VECTOR index on {type_name}.{embedding_field} (dim={dimensions})")
@@ -515,6 +673,59 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             logger.warning(f"Could not create LSM_VECTOR index on {type_name}.{embedding_field}: {e}")
         finally:
             _driver_logger.setLevel(_orig_level)
+
+    def _rebuild_embedded_vector_graphs(self) -> None:
+        """Trigger a vector graph rebuild on all cached indexes in embedded mode.
+
+        Embeddings are written via SQL ``UPDATE ... SET embedding = [...]``, which
+        updates the on-disk record but does **not** notify the in-memory Java
+        ``LSMVectorIndex`` object.  Calling ``build_graph_now()`` after each bulk
+        upsert flush flushes pending mutations into the HNSW graph so that the
+        next ``find_nearest()`` call sees the newly written vectors.
+
+        A WAL flush is performed first so that embedding data written via SQL
+        UPDATE is committed to base page files before ``buildVectorGraphNow()``
+        scans them.  Without this flush the LSMVectorIndex reads partially-written
+        page headers, producing the "Invalid position" / "FALLBACK: Could not read
+        vectors from pages" errors at search time.
+
+        This is a no-op in remote mode (the method should only be called when
+        ``self.mode == "embedded"``).
+        """
+        if not hasattr(self._db, '_vector_indexes'):
+            return
+
+        # In server mode the embedded HTTP server owns all page I/O.  Calling
+        # build_graph_now() on a server-managed database causes LSMVectorIndex
+        # to fight with the server's I/O layer → "FALLBACK: database closing".
+        # The server rebuilds vector graphs automatically after each write.
+        if self._db.is_server_mode:
+            logger.debug("Skipping vector graph rebuild in embedded server mode (server handles it)")
+            return
+
+        # Flush WAL to base pages first so the LSMVectorIndex page scanner sees
+        # fully committed embedding data.
+        self._db.flush_wal()
+
+        rebuilt = 0
+        for cache_key, idx in list(self._db._vector_indexes.items()):
+            try:
+                idx.build_graph_now()
+                rebuilt += 1
+                logger.debug("Rebuilt embedded vector graph for %s", cache_key)
+            except Exception as exc:
+                logger.debug(
+                    "Could not rebuild embedded vector graph for %s: %s",
+                    cache_key,
+                    exc,
+                )
+        if rebuilt:
+            logger.debug("Rebuilt %d embedded vector graph(s) after upsert", rebuilt)
+        else:
+            logger.debug(
+                "No embedded vector graphs rebuilt (cache has %d entries)",
+                len(self._db._vector_indexes),
+            )
 
     def _create_indexes(self) -> None:
         """Create basic indexes for better query performance."""
@@ -850,9 +1061,8 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             return triplets
 
         try:
-            # Resolve logical node ids/names to ArcadeDB @rid values.
-            # TRAVERSE / MATCH both require real RIDs — passing string names fails.
             node_ids = [node.id for node in graph_nodes]
+            logger.debug(f"get_rel_map: resolving {len(node_ids)} node IDs")
 
             vertex_types = self._get_all_vertex_types()
             start_rids: List[str] = []
@@ -876,7 +1086,8 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                             start_rids.append(rid_val)
                             logger.debug(f"get_rel_map: resolved '{node_id}' -> {rid_val} in {vtype}")
                             break
-                    except Exception:
+                    except Exception as resolve_err:
+                        logger.debug(f"get_rel_map: resolve failed for '{node_id}' in {vtype}: {resolve_err}")
                         continue
 
             if not start_rids:
@@ -891,15 +1102,10 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             # in the SELECT list (ArcadeDB rejects them there) and we apply the
             # ignore_rels filter in Python so we don't need @class in a WHERE clause.
             rids_csv = ", ".join(start_rids)
-            if depth <= 1:
-                query = f"SELECT expand(bothE()) FROM [{rids_csv}] LIMIT {limit}"
-            else:
-                query = (
-                    f"SELECT * FROM ("
-                    f"  TRAVERSE bothE() FROM [{rids_csv}] MAXDEPTH {depth}"
-                    f") WHERE @this INSTANCEOF 'E'"
-                    f" LIMIT {limit}"
-                )
+            # Always use expand(bothE()) — it reliably returns edge records directly.
+            # TRAVERSE with WHERE @this INSTANCEOF 'E' can fail in some ArcadeDB
+            # versions/modes if the edge supertype name differs.
+            query = f"SELECT expand(bothE()) FROM [{rids_csv}] LIMIT {limit}"
             logger.debug(f"get_rel_map query: {query}")
             try:
                 results = self._db.query("sql", query)
@@ -913,12 +1119,9 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             for result in results:
                 try:
                     edge_class = result.get('@type', result.get('@class', ''))
-                    # ArcadeDB returns edge endpoints as '@in' / '@out' (system fields),
-                    # not 'in' / 'out' (which are OrientDB conventions).
                     out_rid = result.get('@out', result.get('out'))
                     in_rid  = result.get('@in',  result.get('in'))
 
-                    # Skip vertex records that leaked through (no in/out) and ignored types
                     if not out_rid or not in_rid:
                         logger.debug(f"get_rel_map: skipping non-edge record type={edge_class} keys={list(result.keys())[:8]}")
                         continue
@@ -958,7 +1161,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     logger.debug(f"Failed to parse rel_map edge: {parse_err}")
                     continue
 
-            logger.info(f"get_rel_map: found {len(triplets)} triplets for {len(start_rids)} start vertices")
+            logger.info(f"get_rel_map: resolved {len(start_rids)}/{len(node_ids)} RIDs, found {len(triplets)} triplets")
 
         except Exception as e:
             logger.error(f"Failed to get relationship map: {e}")
@@ -972,7 +1175,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         chunk_count = sum(1 for node in nodes if isinstance(node, ChunkNode))
         other_count = len(nodes) - entity_count - chunk_count
         
-        logger.info(f"DEBUG: Upserting nodes: {entity_count} entities, {chunk_count} chunks, {other_count} other")
+        logger.debug(f"DEBUG: Upserting nodes: {entity_count} entities, {chunk_count} chunks, {other_count} other")
         
         # Try bulk operations first for better performance
         try:
@@ -1169,6 +1372,12 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     import traceback
                     logger.error(f"Traceback: {traceback.format_exc()}")
 
+        # In embedded mode, rebuild vector index graphs now that embeddings have
+        # been written via SQL UPDATE.  This ensures find_nearest() sees the new
+        # data without waiting for the lazy rebuild triggered on first search.
+        if self.mode == "embedded":
+            self._rebuild_embedded_vector_graphs()
+
     def upsert_relations(self, relations: List[Relation]) -> None:
         """Insert or update relationships in the graph using v0.4.0+ bulk operations."""
         logger.info(f"RELATIONS: Upserting {len(relations)} relations")
@@ -1196,7 +1405,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         relation_data.append(data)
                     
                     # Note: bulk_upsert_relations doesn't exist in v0.4.0, fall back to individual
-                    logger.info(f"Processing {len(type_relations)} relations of type {rel_type} individually")
+                    logger.debug(f"Processing {len(type_relations)} relations of type {rel_type} individually")
                     for relation in type_relations:
                         self._upsert_relation(relation)
                     
@@ -1379,9 +1588,6 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 for record in records:
                     try:
                         node = self._result_to_node(record)
-                        # vectorNeighbors returns cosine *distance* (0=identical, 1=orthogonal).
-                        # VectorContextRetriever treats scores as *similarity* (higher = better),
-                        # so convert: similarity = 1.0 - distance.
                         distance = float(record.get('distance', record.get('similarity_score', 1.0)))
                         score = max(0.0, 1.0 - distance)
                         all_results.append((node, score))
@@ -1470,25 +1676,37 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
     def _result_to_node(self, result_data: Dict[str, Any]) -> LabelledNode:
         """Convert query result to LabelledNode."""
-        node_type = result_data.get('@type', result_data.get('@class', 'Entity'))
-        node_id = result_data.get('@rid', str(hash(str(result_data))))
+        # Coerce all keys AND critical string values to Python str.
+        # arcadedb_embedded's wrapped.to_dict() / get_type_name() / get_rid() all
+        # return java.lang.String objects which Pydantic rejects for str fields.
+        result_data = {str(k): v for k, v in result_data.items()}
+        node_type = str(result_data.get('@type', result_data.get('@class', 'Entity')))
+        node_id = str(result_data.get('@rid', str(hash(str(result_data)))))
 
-        # Extract properties, excluding system fields
+        # Extract properties, excluding system fields.
+        # Coerce Java String values to Python str so metadata_dict_to_node
+        # (called by get_llama_nodes) can parse _node_content/_node_type correctly.
+        # JPype Java String objects pass isinstance(v, str) checks in some contexts
+        # but fail JSON parsing — use hasattr('getClass') to detect Java objects.
+        def _coerce(v: Any) -> Any:
+            if v is None:
+                return v
+            if hasattr(v, 'getClass'):
+                cls = v.getClass().getSimpleName()
+                if cls == 'String':
+                    return str(v)
+                if 'RID' in cls:
+                    return str(v)
+            return v
+
         properties = {
-            k: v for k, v in result_data.items()
+            k: _coerce(v) for k, v in result_data.items()
             if not k.startswith('@')
         }
 
         if node_type == 'TextChunk':
-            text = properties.pop('text', '')
-            # Use the logical 'id' field (chunk ID) not the ArcadeDB @rid.
-            # get_llama_nodes builds a map keyed by node.node_id and _add_source_text
-            # looks it up by triplet_source_id — both use the logical chunk ID, so
-            # using @rid here would cause a key mismatch and source text would never
-            # be attached to graph retrieval results.
-            # VectorContextRetriever also matches triplet node IDs against kg_ids
-            # (logical IDs from vector_query) — @rid would always miss, giving score=0.0.
-            logical_id = properties.get('id') or node_id
+            text = str(properties.pop('text', '') or '')
+            logical_id = str(properties.get('id') or node_id)
             return ChunkNode(
                 id_=logical_id,
                 text=text,
@@ -1496,7 +1714,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 properties=properties
             )
         else:
-            name = properties.get('name', node_id)
+            name = str(properties.get('name', node_id) or node_id)
             return EntityNode(
                 name=name,
                 label=node_type,
@@ -1526,7 +1744,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _upsert_entity_node(self, node: EntityNode) -> None:
         """Upsert an entity node."""
         # LOG: What came from LLM
-        logger.info(f"LLM_ENTITY_INPUT: name='{node.name}', label='{node.label}', properties={list(node.properties.keys()) if node.properties else []}")
+        logger.debug(f"LLM_ENTITY_INPUT: name='{node.name}', label='{node.label}', properties={list(node.properties.keys()) if node.properties else []}")
         
         # Validate entity name - reject obviously bad extractions
         if self._is_invalid_entity_name(node.name):
@@ -1540,7 +1758,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         normalized_name = self._normalize_and_deduplicate_entity(node.name)
         
         # LOG: SQL processing decisions
-        logger.info(f"SQL_ENTITY_PROCESSING: original='{node.name}' -> normalized='{normalized_name}', type='{entity_type}'")
+        logger.debug(f"SQL_ENTITY_PROCESSING: original='{node.name}' -> normalized='{normalized_name}', type='{entity_type}'")
         
         # Ensure the entity type exists (dynamic schema)
         self._ensure_dynamic_type(entity_type, 'VERTEX')
@@ -1612,7 +1830,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
     def _upsert_chunk_node(self, node: ChunkNode) -> None:
         """Upsert a text chunk node."""
-        logger.info(f"CHUNK_UPSERT: Storing ChunkNode id={node.id}, text_length={len(node.text)}")
+        logger.debug(f"CHUNK_UPSERT: Storing ChunkNode id={node.id}, text_length={len(node.text)}")
         text_escaped = self._escape_string(node.text)
         
         # Ensure TextChunk type exists (dynamic schema)

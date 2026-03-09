@@ -28,64 +28,91 @@ logger = logging.getLogger(__name__)
 class ArcadeDBGraphStore(GraphStore):
     """
     ArcadeDB Graph Store.
-    
-    This class implements a basic graph store for ArcadeDB, supporting
-    simple triplet storage and retrieval operations.
-    
+
+    Supports both remote HTTP (default) and embedded in-process modes.
+
     Args:
-        host (str): ArcadeDB server hostname
-        port (int): ArcadeDB server port
-        username (str): Database username
-        password (str): Database password
+        mode (str): ``"remote"`` (default) or ``"embedded"``
+        host (str): Remote server hostname (remote mode only)
+        port (int): Remote server port (remote mode only)
+        username (str): Database username (remote mode only)
+        password (str): Database password (remote mode only)
         database (str): Database name
+        db_path (str): Root directory for database files (embedded mode only)
+        embedded_server (bool): Start built-in HTTP server (embedded mode only)
+        embedded_server_port (int): HTTP server port (embedded mode only)
         node_label (str): Default node label for entities
-        **kwargs: Additional connection parameters
     """
 
     def __init__(
         self,
+        mode: str = "remote",
         host: str = "localhost",
         port: int = 2480,
         username: str = "root",
         password: str = "playwithdata",
         database: str = "graph_db",
+        db_path: Optional[str] = None,
+        embedded_server: bool = False,
+        embedded_server_port: int = 2480,
+        embedded_server_password: Optional[str] = None,
         node_label: str = "Entity",
         **kwargs: Any,
     ) -> None:
         """Initialize the ArcadeDB graph store."""
-        self._host = host
-        self._port = port
-        self._username = username
-        self._password = password
-        self._database = database
         self._node_label = node_label
-        
-        # Initialize ArcadeDB client
-        self._client = SyncClient(
-            host=host,
-            port=port,
-            username=username,
-            password=password
-        )
-        
-        # Ensure database exists first
-        self._ensure_database(database)
-        
-        # Initialize database DAO
-        self._db = DatabaseDao(self._client, database)
-        
-        # Create basic schema
+        self._database = database
+        self._client = None
+
+        if mode == "embedded":
+            self._init_embedded(
+                db_path=db_path,
+                database=database,
+                embedded_server=embedded_server,
+                embedded_server_port=embedded_server_port,
+                embedded_server_password=embedded_server_password,
+            )
+        else:
+            self._host = host
+            self._port = port
+            self._username = username
+            self._password = password
+            self._client = SyncClient(
+                host=host, port=port, username=username, password=password
+            )
+            self._ensure_database(database)
+            self._db = DatabaseDao(self._client, database)
+
         self._ensure_schema()
-        
         self.schema = ""
 
+    def _init_embedded(
+        self,
+        db_path: Optional[str],
+        database: str,
+        embedded_server: bool,
+        embedded_server_port: int,
+        embedded_server_password: Optional[str],
+    ) -> None:
+        """Initialise the embedded adapter."""
+        if db_path is None:
+            raise ValueError("db_path is required when mode='embedded'")
+        from llama_index.graph_stores.arcadedb._db_adapter import build_embedded_adapter
+        self._db = build_embedded_adapter(
+            db_path=db_path,
+            database=database,
+            create_if_not_exists=True,
+            embedded_server=embedded_server,
+            embedded_server_port=embedded_server_port,
+            embedded_server_password=embedded_server_password,
+        )
+
     def _ensure_database(self, database_name: str) -> None:
-        """Ensure the database exists."""
+        """Ensure the database exists (remote mode only)."""
+        if self._client is None:
+            return  # embedded — DB created by build_embedded_adapter
         try:
-            # Check if database exists using DatabaseDao.exists method
-            from arcadedb_python.dao.database import DatabaseDao
             if not DatabaseDao.exists(self._client, database_name):
-                # Create database
                 DatabaseDao.create(self._client, database_name)
                 logger.info(f"Created database: {database_name}")
         except Exception as e:

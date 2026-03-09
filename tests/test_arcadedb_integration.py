@@ -1,63 +1,54 @@
 import time
 import unittest
-import docker
 import pytest
+import requests
+
+try:
+    import docker
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+
 from llama_index.graph_stores.arcadedb import ArcadeDBPropertyGraphStore
 from llama_index.core.graph_stores.types import EntityNode, ChunkNode, Relation
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
-# Set up Docker client
-docker_client = docker.from_env()
+_TEST_PORT = 2481
+
+
+def _server_available() -> bool:
+    try:
+        requests.get(f"http://localhost:{_TEST_PORT}", timeout=2)
+        return True
+    except Exception:
+        return False
 
 
 class TestArcadeDBPropertyGraphStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Setup method called once for the entire test class."""
-        # Clean up any existing test containers
-        try:
-            existing = docker_client.containers.get("arcadedb_test_instance_pg")
-            existing.stop()
-            existing.remove()
-        except:
-            pass  # Container doesn't exist
-        
-        # Start ArcadeDB container using HTTP API port 2480
-        try:
-            cls.container = docker_client.containers.run(
-                "arcadedata/arcadedb:latest",
-                detach=True,
-                name="arcadedb_test_instance_pg",
-                ports={"2480/tcp": 2481, "2424/tcp": 2425},  # Map to offset ports to avoid conflicts
-                environment={
-                    "JAVA_OPTS": "-Darcadedb.server.rootPassword=playwithdata"
-                }
+        if not _server_available():
+            raise unittest.SkipTest(
+                f"ArcadeDB test container not available on port {_TEST_PORT} "
+                "(started by conftest.py session fixture)"
             )
-            time.sleep(15)  # Allow time for ArcadeDB to initialize
-        except Exception as e:
-            print(f"Error starting ArcadeDB container: {e}")
-            raise
 
         # Set up the property graph store using HTTP API
         # embedding_dimension=4 matches the 4-dim test vectors used in test_vector_query_with_embeddings
         cls.pg_store = ArcadeDBPropertyGraphStore(
             host="localhost",
-            port=2481,  # HTTP API port (mapped from container's 2480)
+            port=_TEST_PORT,
             username="root",
             password="playwithdata",
-            database="test_graph",  # Use separate test database
-            include_basic_schema=True,  # Enable basic entity types (PERSON, ORGANIZATION, etc.)
-            embedding_dimension=4
+            database="test_graph",
+            include_basic_schema=True,
+            embedding_dimension=4,
         )
 
     @classmethod
     def tearDownClass(cls):
-        """Teardown method called once after all tests are done."""
-        try:
-            cls.container.stop()
-            cls.container.remove()
-        except Exception as e:
-            print(f"Error stopping/removing container: {e}")
+        pass  # Container lifecycle managed by conftest.py
 
     def setUp(self):
         """Clear database before each test."""

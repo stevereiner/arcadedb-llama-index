@@ -1,6 +1,6 @@
 import os
 import pytest
-import docker
+import requests
 import time
 
 from llama_index.graph_stores.arcadedb import ArcadeDBPropertyGraphStore
@@ -8,37 +8,20 @@ from llama_index.core.graph_stores.types import EntityNode, ChunkNode, Relation
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
 arcadedb_host = os.environ.get("ARCADEDB_HOST", "localhost")
-arcadedb_port = int(os.environ.get("ARCADEDB_PORT", "2480"))
+arcadedb_port = int(os.environ.get("ARCADEDB_PORT", "2481"))
 arcadedb_username = os.environ.get("ARCADEDB_USERNAME", "root")
 arcadedb_password = os.environ.get("ARCADEDB_PASSWORD", "playwithdata")
-import time
 arcadedb_database = os.environ.get("ARCADEDB_DATABASE", f"test_{int(time.time())}")
 
-# Test against existing ArcadeDB instance (Docker management disabled for now)
 def setup_module():
-    """Verify ArcadeDB instance is available."""
-    # Try different credential combinations
-    credentials_to_try = [
-        ("root", ""),  # No password
-        ("root", "arcadedb"),  # Default password
-        ("root", "playwithdata"),  # Our custom password
-    ]
-    
-    for username, password in credentials_to_try:
-        try:
-            from arcadedb_python import SyncClient
-            test_client = SyncClient(host="localhost", port=2480, username=username, password=password)
-            print(f"[SUCCESS] Connected to ArcadeDB with credentials: {username}/{password or '(no password)'}")
-            # Update global variables for tests
-            global arcadedb_username, arcadedb_password
-            arcadedb_username = username
-            arcadedb_password = password
-            return
-        except Exception as e:
-            print(f"[FAILED] Failed with {username}/{password or '(no password)'}: {e}")
-            continue
-    
-    raise Exception("[ERROR] Could not connect to ArcadeDB with any credential combination")
+    """Verify ArcadeDB test container is available."""
+    try:
+        requests.get(f"http://{arcadedb_host}:{arcadedb_port}", timeout=2)
+    except Exception:
+        pytest.skip(
+            f"ArcadeDB test container not available on port {arcadedb_port} "
+            "(started by conftest.py session fixture)"
+        )
 
 def teardown_module():
     """No cleanup needed for existing instance."""

@@ -1,60 +1,52 @@
 #!/usr/bin/env python3
 """
-Test different authentication combinations for ArcadeDB.
+Authentication test for ArcadeDB.
+
+Container on port 2481 started automatically by conftest.py.
 """
 
-import requests
-import json
 import pytest
+import requests
+
+_TEST_PORT = 2481
+
+
+def _server_available() -> bool:
+    try:
+        requests.get(f"http://localhost:{_TEST_PORT}", timeout=2)
+        return True
+    except Exception:
+        return False
+
 
 def test_auth_combinations():
-    """Test different username/password combinations."""
-    
-    print("🔧 Testing ArcadeDB authentication...")
-    
-    # First check if ArcadeDB is available
-    try:
-        response = requests.get("http://localhost:2480", timeout=2)
-    except Exception:
-        pytest.skip("ArcadeDB server not available at localhost:2480")
-    
-    # Try the correct credentials first, then fallbacks
+    """Verify root/playwithdata authenticates against the test container."""
+    if not _server_available():
+        pytest.skip(f"ArcadeDB test container not available on port {_TEST_PORT}")
+
     auth_combinations = [
-        ("root", "playwithdata"),  # Correct credentials first
-        ("root", "playingwithdata"),  # Common typo
-        ("admin", "playwithdata"), 
-        ("arcadedb", "playwithdata"),
+        ("root", "playwithdata"),
+        ("root", "playingwithdata"),
+        ("admin", "playwithdata"),
         ("root", "admin"),
         ("admin", "admin"),
-        ("root", ""),
-        ("admin", ""),
     ]
-    
+
     for username, password in auth_combinations:
         try:
-            print(f"\n🔑 Trying {username}/{password}...")
-            
-            # Use the server-level endpoint to list databases — no specific DB required
-            response = requests.get(
-                "http://localhost:2480/api/v1/server",
+            r = requests.get(
+                f"http://localhost:{_TEST_PORT}/api/v1/databases",
                 auth=(username, password),
-                timeout=5
+                timeout=5,
             )
-            
-            if response.status_code == 200:
-                print(f"✅ SUCCESS with {username}/{password}")
-                result = response.json()
-                print(f"   Result: {result}")
-                assert True  # Test passes if we find valid auth
+            if r.status_code == 200:
+                print(f"SUCCESS: {username}/{password}")
                 return
-            else:
-                print(f"❌ Failed: {response.status_code} - {response.text[:100]}")
-                
-        except Exception as e:
-            print(f"❌ Error with {username}/{password}: {e}")
-    
-    print("\n❌ No valid authentication found!")
-    assert False, "No valid authentication found"
+        except Exception:
+            pass
+
+    assert False, f"No valid authentication found on port {_TEST_PORT}"
+
 
 if __name__ == "__main__":
     test_auth_combinations()
