@@ -38,7 +38,7 @@ Example usage (embedded — no server required):
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     from arcadedb_python.api.sync import SyncClient
@@ -86,6 +86,7 @@ from llama_index.core.graph_stores.types import (
     Relation,
     Triplet,
 )
+from llama_index.core.schema import BaseNode, TextNode
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
 from llama_index.graph_stores.arcadedb._db_adapter import (
@@ -95,6 +96,9 @@ from llama_index.graph_stores.arcadedb._db_adapter import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+
 
 
 class ArcadeDBPropertyGraphStore(PropertyGraphStore):
@@ -398,7 +402,11 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     continue
                     
                 try:
-                    query = f"CREATE {type_kind} TYPE {type_name}"
+                    # Entity subtypes extend Entity to inherit properties and LSM_VECTOR index
+                    if type_kind == 'VERTEX' and type_name not in ('Entity', 'TextChunk'):
+                        query = f"CREATE {type_kind} TYPE {type_name} EXTENDS Entity"
+                    else:
+                        query = f"CREATE {type_kind} TYPE {type_name}"
                     result = self._db.query("sql", query, is_command=True)
                     logger.debug(f"Schema created successfully: {query}")
                     
@@ -477,6 +485,12 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             logger.info("Creating indexes for UPSERT operations...")
             self._create_indexes()
 
+            # Discover any dynamic types that existed before this process started
+            # (e.g. COMPANY, TECHNOLOGY from a previous ingest) and populate
+            # _discovered_vertex_types.  Without this, vector_query has an
+            # empty set on first query after restart.
+            self._discover_and_ensure_existing_types()
+
             logger.info(f"Graph schema initialized successfully - created {created_count} new types")
 
         except Exception as e:
@@ -502,8 +516,13 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             return True
             
         try:
-            # Create the type first
-            query = f"CREATE {type_kind} TYPE {type_name} IF NOT EXISTS"
+            # Entity subtypes extend Entity to inherit properties (embedding, name)
+            # and the LSM_VECTOR index — same design as Neo4j's __Entity__ label.
+            # TextChunk and edge types are created without a supertype.
+            if type_kind == 'VERTEX' and type_name not in ('Entity', 'TextChunk'):
+                query = f"CREATE {type_kind} TYPE {type_name} IF NOT EXISTS EXTENDS Entity"
+            else:
+                query = f"CREATE {type_kind} TYPE {type_name} IF NOT EXISTS"
             self._db.query("sql", query, is_command=True)
             
             # For VERTEX types, create essential properties with correct data types
@@ -551,6 +570,30 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _create_vertex_properties(self, type_name: str) -> None:
         """Create essential properties with correct data types for a vertex type."""
         try:
+            # Entity subtypes extend Entity and inherit name + embedding — no property
+            # creation needed.  Attempting to re-create inherited properties raises:
+            # "Cannot create the property 'name' in type 'PERSON' because it was
+            # already defined in a super type" (ArcadeDB SchemaException).
+            if type_name not in ('Entity', 'TextChunk'):
+                # Entity subtypes inherit 'name', 'embedding', 'ref_doc_id',
+                # 'doc_id', and 'triplet_source_id' from Entity — creating those
+                # properties again raises SchemaException.  Track them as known
+                # so _ensure_property() never tries to re-create them.
+                for inherited_prop in ('name', 'embedding', 'ref_doc_id', 'doc_id', 'triplet_source_id'):
+                    self._known_properties.add((type_name, inherited_prop))
+                # Per-subtype UNIQUE(name) — required so UPDATE <SubType> UPSERT WHERE name=?
+                # resolves within the subtype's own index scope.
+                try:
+                    self._db.query(
+                        "sql",
+                        f"CREATE INDEX IF NOT EXISTS ON {type_name} (name) UNIQUE",
+                        is_command=True,
+                    )
+                    logger.debug(f"Created UNIQUE index on {type_name}.name")
+                except Exception as idx_err:
+                    if "already exists" not in str(idx_err).lower():
+                        logger.debug(f"UNIQUE index on {type_name}.name: {idx_err}")
+                return
             # Define property schemas based on vertex type - include embedding for vector functionality
             if type_name == 'TextChunk':
                 # TextChunk uses 'id' as primary key (STRING)
@@ -561,10 +604,18 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                     ('embedding', 'ARRAY_OF_FLOATS', '')  # Native float array for LSM_VECTOR index
                 ]
             else:
-                # Entity types use 'name' as primary key (STRING)
+                # Entity base type: name + embedding + ref_doc_id + doc_id + triplet_source_id
+                # declared here so every subtype inherits them automatically.
+                # ref_doc_id: delete_ref_doc() removes TextChunks by this ID
+                # doc_id:     engine.py Step 2 delete(properties={'doc_id':...}) removes entities
+                # triplet_source_id: LlamaIndex TRIPLET_SOURCE_KEY — links entity to TextChunk
+                #             for add_source_text() source filename/passage lookup
                 properties = [
                     ('name', 'STRING', ''),
-                    ('embedding', 'ARRAY_OF_FLOATS', '')  # Native float array for LSM_VECTOR index
+                    ('ref_doc_id', 'STRING', ''),
+                    ('doc_id', 'STRING', ''),
+                    ('triplet_source_id', 'STRING', ''),
+                    ('embedding', 'ARRAY_OF_FLOATS', '')
                 ]
             
             # Create each property with proper data type using correct IF NOT EXISTS syntax
@@ -577,22 +628,21 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 except Exception as prop_error:
                     logger.warning(f"Property creation failed for {type_name}.{prop_name}: {prop_error}")
             
-            # Create UNIQUE index on the primary key property
-            primary_key = 'id' if type_name == 'TextChunk' else 'name'
-            try:
-                index_query = f"CREATE INDEX IF NOT EXISTS ON {type_name} ({primary_key}) UNIQUE"
-                self._db.query("sql", index_query, is_command=True)
-                logger.debug(f"Created UNIQUE index on {type_name}.{primary_key}")
-            except Exception as index_error:
-                error_msg = str(index_error)
-                if "already exists" in error_msg.lower():
-                    logger.debug(f"Index on {type_name}.{primary_key} already exists")
-                else:
-                    logger.debug(f"Index creation for {type_name}.{primary_key}: {index_error}")
-
-            # Create LSM_VECTOR index on embedding if dimension is configured
-            if self.embedding_dimension:
-                self._ensure_vector_index(type_name, 'embedding', self.embedding_dimension)
+            # Create UNIQUE index on the primary key property.
+            # TextChunk: UNIQUE on 'id'. Entity base: LSM_VECTOR only — per-subtype
+            # UNIQUE(name) indexes are created in _create_vertex_properties for each subtype.
+            if type_name == 'TextChunk':
+                try:
+                    self._db.query("sql", "CREATE INDEX IF NOT EXISTS ON TextChunk (id) UNIQUE", is_command=True)
+                    logger.debug("Created UNIQUE index on TextChunk.id")
+                except Exception as index_error:
+                    if "already exists" not in str(index_error).lower():
+                        logger.debug(f"Index creation for TextChunk.id: {index_error}")
+                if self.embedding_dimension:
+                    self._ensure_vector_index('TextChunk', 'embedding', self.embedding_dimension)
+            elif type_name == 'Entity':
+                if self.embedding_dimension:
+                    self._ensure_vector_index('Entity', 'embedding', self.embedding_dimension)
 
             # Mark all declared properties as known so _ensure_property() won't
             # re-send DDL for them.
@@ -648,29 +698,29 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def _ensure_vector_index(self, type_name: str, embedding_field: str, dimensions: int) -> None:
         """Create an LSM_VECTOR index on the embedding field if it doesn't already exist."""
         import logging as _logging
-        # In remote mode the arcadedb-python SyncClient logs every non-2xx response at
-        # ERROR level before raising.  Temporarily silence it so "already exists" isn't noisy.
+        # Silence the arcadedb-python SyncClient which logs every non-2xx at ERROR level.
         _driver_logger = _logging.getLogger('arcadedb_python.api.sync')
         _orig_level = _driver_logger.level
         if self.mode == "remote":
             _driver_logger.setLevel(_logging.CRITICAL)
         try:
-            self._db.create_vector_index(type_name, embedding_field, dimensions)
-            logger.debug(f"Created LSM_VECTOR index on {type_name}.{embedding_field} (dim={dimensions})")
-        except VectorOperationException as e:
-            # The driver raises VectorOperationException without forwarding the ArcadeDB
-            # detail, but the original exception is chained via __cause__.  Check the
-            # full chain for "already exists" before treating it as a real error.
-            cause_detail = ''
-            if e.__cause__ is not None:
-                cause = e.__cause__
-                cause_detail = (getattr(cause, 'detail', None) or str(cause)).lower()
-            if "already exists" in cause_detail:
+            # Issue SQL directly so we can check the full error text.
+            # ArcadeDB does not support IF NOT EXISTS on LSM_VECTOR indexes,
+            # so we catch the "already exists" error and treat it as success.
+            sql = (
+                f"CREATE INDEX ON {type_name} ({embedding_field}) LSM_VECTOR METADATA {{"
+                f" dimensions: {dimensions}, similarity: 'COSINE' }}"
+            )
+            self._db.query("sql", sql, is_command=True)
+            logger.info(f"Created LSM_VECTOR index on {type_name}.{embedding_field} (dim={dimensions})")
+        except Exception as e:
+            err = str(e).lower()
+            cause_str = str(getattr(e, '__cause__', '') or '').lower()
+            full_err = err + ' ' + cause_str
+            if "already exists" in full_err or "already defined" in full_err or "existent index" in full_err:
                 logger.debug(f"LSM_VECTOR index on {type_name}.{embedding_field} already exists")
             else:
                 logger.warning(f"Could not create LSM_VECTOR index on {type_name}.{embedding_field}: {e}")
-        except Exception as e:
-            logger.warning(f"Could not create LSM_VECTOR index on {type_name}.{embedding_field}: {e}")
         finally:
             _driver_logger.setLevel(_orig_level)
 
@@ -727,14 +777,86 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                 len(self._db._vector_indexes),
             )
 
+    def _discover_and_ensure_existing_types(self) -> None:
+        """Populate _discovered_vertex_types from the live schema.
+
+        Called once on startup after _create_indexes().  Any type that was
+        created by a previous process run (COMPANY, TECHNOLOGY, SKILL, etc.)
+        won't be in _discovered_vertex_types yet.  Without this, vector_query
+        has an empty set and searches nothing on the first query after restart.
+
+        Also pre-populates _known_properties with ALL properties defined on
+        each type (including inherited ones) so that _ensure_property() never
+        fires CREATE PROPERTY DDL for something that already exists.  This is
+        critical because ArcadeDB rejects CREATE PROPERTY SubType.prop even
+        with IF NOT EXISTS when prop is inherited from a supertype.
+        """
+        try:
+            # Fetch all vertex types from the live schema
+            type_rows = self._db.query(
+                "sql", "SELECT name, properties FROM schema:types WHERE type = 'vertex'"
+            )
+            if not type_rows:
+                return
+
+            # Build per-type property cache from the schema:types properties array.
+            # Each row has 'name' (type name) and 'properties' (list of property dicts).
+            # Pre-populate _known_properties so _ensure_property() never fires DDL
+            # for already-existing properties — including inherited ones from Entity.
+            try:
+                entity_props = set()
+                for row in type_rows:
+                    t = row.get('name', '')
+                    props = row.get('properties') or []
+                    if not t:
+                        continue
+                    for prop in (props if isinstance(props, list) else []):
+                        p = prop.get('name', '') if isinstance(prop, dict) else str(prop)
+                        if p:
+                            self._known_properties.add((t, p))
+                    if t == 'Entity':
+                        entity_props = {
+                            (prop.get('name', '') if isinstance(prop, dict) else str(prop))
+                            for prop in (props if isinstance(props, list) else [])
+                            if (prop.get('name', '') if isinstance(prop, dict) else str(prop))
+                        }
+            except Exception as prop_err:
+                logger.debug(f"_discover_and_ensure_existing_types: property prefetch failed: {prop_err}")
+                entity_props = set()
+
+            base_types = {'Entity', 'TextChunk'}
+            for row in type_rows:
+                type_name = row.get('name', '')
+                if not type_name or type_name in base_types:
+                    continue
+                self._discovered_vertex_types.add(type_name)
+                # Inherited properties are accessible on every subtype.
+                # Pre-mark them as known so _ensure_property never tries DDL.
+                for p in entity_props:
+                    self._known_properties.add((type_name, p))
+                # Ensure per-subtype UNIQUE(name) exists for UPSERT — idempotent.
+                try:
+                    self._db.query(
+                        "sql",
+                        f"CREATE INDEX IF NOT EXISTS ON {type_name} (name) UNIQUE",
+                        is_command=True,
+                    )
+                except Exception:
+                    pass
+
+            logger.info(
+                f"Discovered {len(self._discovered_vertex_types)} existing vertex types: "
+                f"{sorted(self._discovered_vertex_types)}"
+            )
+        except Exception as e:
+            logger.debug(f"_discover_and_ensure_existing_types: {e}")
+
     def _create_indexes(self) -> None:
         """Create basic indexes for better query performance."""
-        # Define essential indexes - REQUIRED for UPSERT operations
         index_definitions = [
-            # Essential indexes - required for basic functionality
-            ("TextChunk", "id", "textchunk_id_idx"),  # Required for chunk UPSERT
-            ("Entity", "name", "entity_name_idx"),    # Required for generic entity UPSERT
-            # Core entity type indexes - for commonly used pre-created types
+            ("TextChunk", "id", "textchunk_id_idx"),
+            # Per-subtype UNIQUE(name) for the four basic schema types.
+            # Dynamically created subtypes get their index in _create_vertex_properties.
             ("PERSON", "name", "person_name_idx"),
             ("ORGANIZATION", "name", "org_name_idx"),
             ("LOCATION", "name", "location_name_idx"),
@@ -744,22 +866,20 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         created_indexes = 0
         for type_name, property_name, index_name in index_definitions:
             try:
-                # Step 1: Ensure property exists first using correct IF NOT EXISTS syntax
-                try:
-                    prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
-                    self._db.query("sql", prop_query, is_command=True)
-                    logger.debug(f"Created property {type_name}.{property_name}")
-                except Exception as prop_error:
-                    logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
+                if type_name == 'TextChunk':
+                    try:
+                        prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
+                        self._db.query("sql", prop_query, is_command=True)
+                        logger.debug(f"Created property {type_name}.{property_name}")
+                    except Exception as prop_error:
+                        logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
                 
-                # Step 2: Create UNIQUE index (ArcadeDB requires properties to exist first)
                 query = f"CREATE INDEX IF NOT EXISTS ON {type_name} ({property_name}) UNIQUE"
                 self._db.query("sql", query, is_command=True)
-                logger.debug(f"Created UNIQUE index on {type_name}.{property_name} (auto-named as {type_name}[{property_name}])")
+                logger.debug(f"Created UNIQUE index on {type_name}.{property_name}")
                 created_indexes += 1
             except Exception as e:
                 error_msg = str(e)
-                # Skip if index already exists or property/syntax issues
                 if ("already exists" in error_msg.lower() or 
                     "duplicate" in error_msg.lower() or 
                     "index already defined" in error_msg.lower() or
@@ -772,30 +892,44 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         
         logger.info(f"Created {created_indexes} new indexes for UPSERT operations")
 
+        # LSM_VECTOR on Entity base and TextChunk — subtypes of Entity inherit it;
+        # vector search uses vectorNeighbors('<SubType>[embedding]', ...) which ArcadeDB resolves correctly.
+        if self.embedding_dimension:
+            self._ensure_vector_index('Entity', 'embedding', self.embedding_dimension)
+            # TextChunk needs its embedding property declared before the index can be created.
+            try:
+                self._db.query(
+                    "sql",
+                    "CREATE PROPERTY TextChunk.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
+                    is_command=True,
+                )
+            except Exception:
+                pass
+            self._ensure_vector_index('TextChunk', 'embedding', self.embedding_dimension)
+
     def _ensure_index_for_upsert(self, type_name: str, property_name: str) -> None:
-        """Ensure a UNIQUE index exists for UPSERT operations on the given type and property.
-        
-        Note: With dynamic type creation, properties and indexes are usually created
-        automatically when the type is created. This method serves as a fallback.
-        """
-        # If this is a standard property for essential types or basic schema types,
-        # it should already be created by _create_vertex_properties()
-        if ((type_name == 'TextChunk' and property_name == 'id') or
-            (type_name == 'Entity' and property_name == 'name') or
-            (self.include_basic_schema and type_name in ['PERSON', 'ORGANIZATION', 'LOCATION', 'PLACE'] and property_name == 'name')):
-            logger.debug(f"Index for {type_name}.{property_name} should already exist from schema creation")
+        """Ensure a UNIQUE index exists for UPSERT operations on the given type and property."""
+        # Indexes for these types are already created during schema initialisation.
+        already_created = (
+            (type_name == 'TextChunk' and property_name == 'id') or
+            (type_name in ('PERSON', 'ORGANIZATION', 'LOCATION', 'PLACE') and property_name == 'name')
+        )
+        if already_created:
+            logger.debug(f"Index for {type_name}.{property_name} already exists from schema creation")
             return
-        
-        # Fallback: Create property and index if needed (for non-standard properties)
-        # Step 1: Ensure the property exists using correct IF NOT EXISTS syntax
-        try:
-            prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
-            self._db.query("sql", prop_query, is_command=True)
-            logger.debug(f"Created fallback property {type_name}.{property_name}")
-        except Exception as prop_error:
-            logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
-        
-        # Step 2: Create UNIQUE index
+
+        # 'name' is an inherited property on subtypes — skip property DDL, only need the index.
+        is_entity_subtype_name = (
+            type_name not in ('Entity', 'TextChunk') and property_name == 'name'
+        )
+        if not is_entity_subtype_name:
+            try:
+                prop_query = f"CREATE PROPERTY {type_name}.{property_name} IF NOT EXISTS STRING"
+                self._db.query("sql", prop_query, is_command=True)
+                logger.debug(f"Created fallback property {type_name}.{property_name}")
+            except Exception as prop_error:
+                logger.debug(f"Property creation for {type_name}.{property_name}: {prop_error}")
+
         try:
             index_query = f"CREATE INDEX IF NOT EXISTS ON {type_name} ({property_name}) UNIQUE"
             self._db.query("sql", index_query, is_command=True)
@@ -826,13 +960,40 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # Fallback: essential types + everything we have dynamically discovered
         return list({'Entity', 'TextChunk'} | self._discovered_vertex_types)
 
+    @staticmethod
+    def _record_rid_key(record: Any) -> Optional[str]:
+        """ArcadeDB @rid for deduping: SELECT FROM Entity is polymorphic and returns
+        the same vertices as subtype tables (PERSON, PROJECT, ...)."""
+        if not isinstance(record, dict):
+            return None
+        rid = None
+        for k, v in record.items():
+            if str(k) == "@rid":
+                rid = v
+                break
+        if rid is None:
+            return None
+        if hasattr(rid, "getClass"):
+            return str(rid)
+        return str(rid)
+
     def get(
         self,
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[LabelledNode]:
         """Get nodes with matching properties or ids."""
-        nodes = []
+        nodes: List[LabelledNode] = []
+        seen_rids: Set[str] = set()
+
+        def _append_if_new(record: Any) -> None:
+            key = self._record_rid_key(record)
+            if key is not None and key in seen_rids:
+                return
+            node = self._result_to_node(record)
+            if key is not None:
+                seen_rids.add(key)
+            nodes.append(node)
 
         try:
             if ids:
@@ -866,8 +1027,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                             if results and isinstance(results, list):
                                 for result in results:
                                     try:
-                                        node = self._result_to_node(result)
-                                        nodes.append(node)
+                                        _append_if_new(result)
                                     except Exception as conv_e:
                                         logger.warning(f"Failed to convert result to node: {conv_e}, result: {result}")
                                 found = True
@@ -909,7 +1069,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         results = self._db.query("sql", query)
                         if results and isinstance(results, list):
                             for result in results:
-                                nodes.append(self._result_to_node(result))
+                                _append_if_new(result)
                     except Exception:
                         pass  # Ignore errors, table might not exist or be empty
             else:
@@ -933,7 +1093,7 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         results = self._db.query("sql", query)
                         if results and isinstance(results, list):
                             for result in results:
-                                nodes.append(self._result_to_node(result))
+                                _append_if_new(result)
                     except Exception:
                         pass  # Ignore errors, table might not exist or be empty
 
@@ -1224,16 +1384,38 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
 
                         has_embedding = hasattr(node, 'embedding') and node.embedding is not None
 
+                        # ref_doc_id is declared on Entity base type (inherited by all subtypes).
+                        # Write it explicitly here so it's always set, and skip it in the
+                        # property loop below to avoid _ensure_property() DDL on the subtype.
+                        ref_doc_id = getattr(node, 'ref_doc_id', None)
+                        if ref_doc_id is None and node.properties:
+                            ref_doc_id = node.properties.get('ref_doc_id')
+                        if ref_doc_id:
+                            prop_assignments.append(f"ref_doc_id = '{self._escape_string(str(ref_doc_id))}'")
+
+                        # triplet_source_id is also declared on Entity base type (inherited).
+                        # Write it explicitly and skip in the property loop.
+                        triplet_source_id = node.properties.get('triplet_source_id') if node.properties else None
+                        if triplet_source_id:
+                            prop_assignments.append(f"triplet_source_id = '{self._escape_string(str(triplet_source_id))}'")
+
+                        # doc_id is also declared on Entity base type (inherited).
+                        # engine.py Step 2 uses delete(properties={'doc_id':...}) to remove entities.
+                        doc_id_val = node.properties.get('doc_id') if node.properties else None
+                        if doc_id_val:
+                            prop_assignments.append(f"doc_id = '{self._escape_string(str(doc_id_val))}'")
+
                         if node.properties:
                             for k, v in node.properties.items():
-                                if k != 'embedding':
-                                    self._ensure_property(entity_type, k)
-                                    safe_k = self._sql_identifier(k)
-                                    if isinstance(v, (list, dict)):
-                                        escaped_value = self._escape_string(json.dumps(v))
-                                    else:
-                                        escaped_value = self._escape_string(str(v))
-                                    prop_assignments.append(f"{safe_k} = '{escaped_value}'")
+                                if k == 'embedding' or k == 'ref_doc_id' or k == 'triplet_source_id' or k == 'doc_id':
+                                    continue
+                                self._ensure_property(entity_type, k)
+                                safe_k = self._sql_identifier(k)
+                                if isinstance(v, (list, dict)):
+                                    escaped_value = self._escape_string(json.dumps(v))
+                                else:
+                                    escaped_value = self._escape_string(str(v))
+                                prop_assignments.append(f"{safe_k} = '{escaped_value}'")
 
                         upsert_stmt = (
                             f"UPDATE {entity_type} SET {', '.join(prop_assignments)}"
@@ -1258,7 +1440,11 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
                         # Avoid logging enormous SQL with embedded 1536-dim vectors
                         if len(err_str) > 300:
                             err_str = err_str[:300] + "... [truncated]"
-                        logger.warning(f"SQL upsert failed for entity {normalized_name}, falling back: {err_str}")
+                        is_dup = "duplicate" in err_str.lower() or "duplicated key" in err_str.lower()
+                        if is_dup:
+                            logger.debug(f"SQL upsert duplicate key for '{normalized_name}', retrying via UPDATE")
+                        else:
+                            logger.warning(f"SQL upsert failed for entity {normalized_name}, falling back: {err_str}")
                         try:
                             self._upsert_entity_node(node)
                             succeeded += 1
@@ -1554,14 +1740,25 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Execute a vector similarity search using ArcadeDB's LSM_VECTOR index.
 
-        Searches all known vertex types that have an embedding field and returns
-        the top-k most similar nodes together with their cosine distances.
+        The LSM_VECTOR index is declared once on the Entity base type; subtypes
+        inherit it.  Records are stored on subtypes (PERSON, COMPANY, etc.), so
+        vector search is issued against each subtype's index name
+        (<SubType>[embedding]) — not Entity itself.
+
+        Remote mode: issues SELECT vectorNeighbors(...) AS neighbors directly
+        via RemoteAdapter.query() which returns plain dicts with a 'neighbors' key.
+
+        Embedded mode: delegates to EmbeddedAdapter.vector_search() which handles
+        the Java object unwrapping (_vector_search_sql for server mode,
+        find_nearest for direct mode).  The plain .query() path cannot be used
+        for embedded vectorNeighbors because _result_to_dict wraps the result in
+        a 'res' key and leaves Java Vertex objects un-converted.
 
         Args:
             query: VectorStoreQuery containing query_embedding and similarity_top_k.
 
         Returns:
-            Tuple of (nodes, scores) where scores are cosine distances (lower = closer).
+            Tuple of (nodes, scores) where scores are cosine similarities (higher = closer).
         """
         if not query.query_embedding:
             logger.debug("No query embedding provided for vector search")
@@ -1570,43 +1767,139 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         top_k = query.similarity_top_k or 10
         query_embedding = list(query.query_embedding)
 
-        # Search every vertex type that has been created with an embedding property
-        vertex_types = list(
-            {'Entity', 'TextChunk'} | self._discovered_vertex_types
-        )
+        # Search every discovered entity subtype using its inherited LSM_VECTOR index.
+        # Exclude TextChunk (text embeddings) and Entity base (records live on subtypes).
+        entity_subtypes = list(self._discovered_vertex_types - {'TextChunk', 'Entity'})
+        if not entity_subtypes:
+            logger.info("vector_query: no entity subtypes discovered yet")
+            return [], []
 
         all_results: List[Tuple[LabelledNode, float]] = []
 
-        for type_name in vertex_types:
+        import logging as _logging
+        _driver_logger = _logging.getLogger('arcadedb_python.api.sync')
+
+        for type_name in entity_subtypes:
             try:
-                records = self._db.vector_search(
-                    type_name=type_name,
-                    embedding_field='embedding',
-                    query_embedding=query_embedding,
-                    top_k=top_k,
-                )
-                for record in records:
+                if self.mode == "embedded":
+                    raw_rows = self._db.vector_search(type_name, 'embedding', query_embedding, top_k)
+                else:
+                    # Silence the arcadedb-python driver for remote — it logs every
+                    # non-2xx response at ERROR level, including empty vector results.
+                    _orig = _driver_logger.level
+                    _driver_logger.setLevel(_logging.CRITICAL)
                     try:
-                        node = self._result_to_node(record)
-                        distance = float(record.get('distance', record.get('similarity_score', 1.0)))
+                        raw_results = self._db.query(
+                            "sql",
+                            f"SELECT vectorNeighbors('{type_name}[embedding]', {query_embedding}, {top_k})"
+                            f" AS neighbors FROM {type_name} LIMIT 1"
+                        )
+                    finally:
+                        _driver_logger.setLevel(_orig)
+
+                if self.mode == "embedded":
+                    # Embedded adapter has proper Java-object unwrapping for vectorNeighbors.
+                    # Returns list of dicts with keys from the entity vertex plus 'distance'.
+                    type_results = []
+                    for row in raw_rows:
+                        distance = float(row.pop("distance", 1.0))
                         score = max(0.0, 1.0 - distance)
-                        all_results.append((node, score))
-                    except Exception as conv_err:
-                        logger.debug(f"Could not convert vector result to node: {conv_err}")
+                        try:
+                            node = self._result_to_node(row)
+                            type_results.append((node, score))
+                        except Exception as conv_err:
+                            logger.debug(f"Could not convert vector result to node: {conv_err}")
+                else:
+                    # Remote mode: vectorNeighbors('<SubType>[embedding]', q) FROM <SubType>
+                    # ArcadeDB resolves the inherited index by the subtype name even when
+                    # the LSM_VECTOR is declared only on the Entity base type.
+                    if not raw_results or not raw_results[0]:
+                        logger.debug(f"vector_search({type_name!r}): 0 results")
+                        continue
+                    neighbors = raw_results[0].get("neighbors", [])
+                    if not isinstance(neighbors, list):
+                        continue
+                    type_results = []
+                    for nb in neighbors:
+                        if not isinstance(nb, dict):
+                            continue
+                        record = nb.get("record", {})
+                        distance = float(nb.get("distance", 1.0))
+                        score = max(0.0, 1.0 - distance)
+                        try:
+                            node = self._result_to_node(record)
+                            type_results.append((node, score))
+                        except Exception as conv_err:
+                            logger.debug(f"Could not convert vector result to node: {conv_err}")
+
+                if type_results:
+                    type_counts: dict = {}
+                    for node, _ in type_results:
+                        t = getattr(node, 'label', type(node).__name__)
+                        type_counts[t] = type_counts.get(t, 0) + 1
+                    logger.info(f"vector_search({type_name!r}): {len(type_results)} results — {type_counts}")
+                else:
+                    logger.debug(f"vector_search({type_name!r}): 0 results")
+                all_results.extend(type_results)
             except Exception as e:
                 logger.debug(f"Vector search failed for type {type_name}: {e}")
 
         if not all_results:
             return [], []
 
-        # Sort by score descending (higher similarity = better match) and trim to top_k
+        # Sort by score descending and trim to top_k
         all_results.sort(key=lambda x: x[1], reverse=True)
         all_results = all_results[:top_k]
 
         nodes = [r[0] for r in all_results]
         scores = [r[1] for r in all_results]
-        logger.info(f"Vector query returned {len(nodes)} results across {len(vertex_types)} types")
+        logger.info(f"Vector query: top {len(nodes)} results after merge — scores {[round(s,3) for s in scores]}")
         return nodes, scores
+
+    def get_llama_nodes(self, node_ids: List[str]) -> List[BaseNode]:
+        """Fetch TextChunk source nodes from ArcadeDB by their chunk ID (ref_doc_id).
+
+        Called by BasePGRetriever.add_source_text() to attach original chunk text to
+        triplet results.  The in-memory LlamaIndex docstore is empty after a restart,
+        so we query ArcadeDB directly — TextChunk records store their chunk UUID in
+        the 'id' property.
+        """
+        if not node_ids:
+            return []
+        result_nodes: List[BaseNode] = []
+        for chunk_id in node_ids:
+            if not chunk_id:
+                continue
+            try:
+                safe_id = self._escape_string(str(chunk_id))
+                rows = self._db.query(
+                    "sql",
+                    f"SELECT id, text, ref_doc_id, source, file_name, file_type, file_path"
+                    f" FROM TextChunk WHERE id = '{safe_id}' LIMIT 1",
+                )
+                if rows:
+                    row = rows[0]
+                    text = row.get('text') or ''
+                    metadata = {
+                        'ref_doc_id': row.get('ref_doc_id') or '',
+                        'source': row.get('source') or row.get('file_name') or '',
+                        'file_name': row.get('file_name') or '',
+                        'file_type': row.get('file_type') or '',
+                        'file_path': row.get('file_path') or '',
+                    }
+                    node = TextNode(
+                        id_=str(row.get('id', chunk_id)),
+                        text=text,
+                        metadata=metadata,
+                    )
+                    result_nodes.append(node)
+            except Exception as e:
+                logger.debug(f"get_llama_nodes: failed to fetch chunk {chunk_id}: {e}")
+        return result_nodes
+
+    async def aget_llama_nodes(self, node_ids: List[str]) -> List[BaseNode]:
+        """Async version — delegates to sync (ArcadeDB client is sync-only)."""
+        return self.get_llama_nodes(node_ids)
 
     def get_schema(self, refresh: bool = False) -> Any:
         """Get the database schema in LlamaIndex-compatible format."""
@@ -1763,7 +2056,8 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # Ensure the entity type exists (dynamic schema)
         self._ensure_dynamic_type(entity_type, 'VERTEX')
         
-        # Ensure index exists for UPSERT (required by ArcadeDB)
+        # Ensure index exists for UPSERT (required by ArcadeDB).
+        # Entity base carries UNIQUE(name); subtypes inherit it — no per-subtype DDL.
         self._ensure_index_for_upsert(entity_type, 'name')
         
         # Use ArcadeDB's native UPDATE ... UPSERT syntax for atomic upsert
@@ -1774,17 +2068,39 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         # rejects inside a SET clause.
         has_embedding = hasattr(node, 'embedding') and node.embedding is not None
 
-        # Add other properties, ensuring each is declared on the type first
+        # ref_doc_id is declared on Entity base type (inherited by all subtypes).
+        # Write it explicitly; skip it in the property loop to avoid DDL on the subtype.
+        ref_doc_id = getattr(node, 'ref_doc_id', None)
+        if ref_doc_id is None and node.properties:
+            ref_doc_id = node.properties.get('ref_doc_id')
+        if ref_doc_id:
+            prop_assignments.append(f"ref_doc_id = '{self._escape_string(str(ref_doc_id))}'")
+
+        # triplet_source_id is also declared on Entity base type (inherited).
+        # Write it explicitly and skip in the property loop.
+        triplet_source_id = node.properties.get('triplet_source_id') if node.properties else None
+        if triplet_source_id:
+            prop_assignments.append(f"triplet_source_id = '{self._escape_string(str(triplet_source_id))}'")
+
+        # doc_id is also declared on Entity base type (inherited).
+        # engine.py Step 2 uses delete(properties={'doc_id':...}) to remove entities.
+        doc_id_val = node.properties.get('doc_id') if node.properties else None
+        if doc_id_val:
+            prop_assignments.append(f"doc_id = '{self._escape_string(str(doc_id_val))}'")
+
+        # Add other properties, ensuring each is declared on the type first.
+        # Skip document-level metadata fields and inherited base-type properties.
         if node.properties:
             for k, v in node.properties.items():
-                if k != 'embedding':
-                    v_str = str(v)
-                    if len(v_str) > 1000:
-                        logger.debug(f"Skipping large property {k} for entity {normalized_name} (size: {len(v_str)})")
-                        continue
-                    self._ensure_property(entity_type, k)
-                    safe_k = self._sql_identifier(k)
-                    prop_assignments.append(f"{safe_k} = '{self._escape_string(v_str)}'")
+                if k == 'embedding' or k == 'ref_doc_id' or k == 'triplet_source_id' or k == 'doc_id':
+                    continue
+                v_str = str(v)
+                if len(v_str) > 1000:
+                    logger.debug(f"Skipping large property {k} for entity {normalized_name} (size: {len(v_str)})")
+                    continue
+                self._ensure_property(entity_type, k)
+                safe_k = self._sql_identifier(k)
+                prop_assignments.append(f"{safe_k} = '{self._escape_string(v_str)}'")
         
         try:
             # Use ArcadeDB's native UPDATE ... UPSERT syntax (atomic operation)
@@ -1802,31 +2118,36 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
             
         except Exception as e:
             err_str = str(e)
+            is_duplicate = "duplicate" in err_str.lower() or "duplicated key" in err_str.lower()
             if len(err_str) > 300:
                 err_str = err_str[:300] + "... [truncated]"
             logger.warning(f"{entity_type} UPSERT failed for '{normalized_name}': {err_str}")
-            # Fallback to basic insert if UPSERT fails
-            try:
-                basic_query = f"INSERT INTO {entity_type} SET name = '{self._escape_string(normalized_name)}'"
-                logger.debug(f"Fallback basic insert for {normalized_name}")
-                self._db.query("sql", basic_query, is_command=True)
-                self._create_mentions_relationship_sql(node, entity_type)
-            except TransactionException as fallback_error:
-                detail = (fallback_error.detail or '').lower()
-                if "duplicate" in detail or "duplicated key" in detail:
-                    logger.debug(f"Entity '{normalized_name}' already exists in {entity_type} (duplicate key - ok)")
+
+            if is_duplicate:
+                # Record already exists (concurrent insert from another chunk won the race).
+                # Fall back to a plain UPDATE to apply any new property values.
+                try:
+                    update_query = f"UPDATE {entity_type} SET {', '.join(prop_assignments)} WHERE name = '{self._escape_string(normalized_name)}'"
+                    self._db.query("sql", update_query, is_command=True)
+                    logger.debug(f"Duplicate-key fallback UPDATE succeeded for '{normalized_name}'")
                     self._create_mentions_relationship_sql(node, entity_type)
-                else:
-                    logger.warning(f"Insert fallback also failed for '{normalized_name}': {fallback_error}")
-            except Exception as fallback_error:
-                fallback_str = str(fallback_error)
-                if "duplicate" in fallback_str.lower() or "duplicated key" in fallback_str.lower():
-                    logger.debug(f"Entity '{normalized_name}' already exists in {entity_type} (duplicate key - ok)")
+                except Exception as upd_err:
+                    logger.warning(f"Duplicate-key fallback UPDATE also failed for '{normalized_name}': {upd_err}")
+            else:
+                # Non-duplicate failure — try a basic INSERT as a last resort.
+                try:
+                    basic_query = f"INSERT INTO {entity_type} SET name = '{self._escape_string(normalized_name)}'"
+                    self._db.query("sql", basic_query, is_command=True)
                     self._create_mentions_relationship_sql(node, entity_type)
-                else:
-                    if len(fallback_str) > 300:
-                        fallback_str = fallback_str[:300] + "... [truncated]"
-                    logger.warning(f"Insert fallback also failed for '{normalized_name}': {fallback_str}")
+                except Exception as fallback_error:
+                    fallback_str = str(fallback_error)
+                    if "duplicate" in fallback_str.lower() or "duplicated key" in fallback_str.lower():
+                        logger.debug(f"Entity '{normalized_name}' already exists in {entity_type} (ok)")
+                        self._create_mentions_relationship_sql(node, entity_type)
+                    else:
+                        if len(fallback_str) > 300:
+                            fallback_str = fallback_str[:300] + "... [truncated]"
+                        logger.warning(f"Insert fallback also failed for '{normalized_name}': {fallback_str}")
 
     def _upsert_chunk_node(self, node: ChunkNode) -> None:
         """Upsert a text chunk node."""

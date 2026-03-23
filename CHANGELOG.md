@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-22] - 0.4.2 Release: Entity base-type inheritance, real vector search scores, TextChunk vector index, logging suppression
+
+### Added
+
+- **Inheritance index tests** — `tests/test_remote_inheritance_indexes.py` and `tests/test_embedded_inheritance_indexes.py` verify that a `UNIQUE` property index and an `LSM_VECTOR` index on a base type are correctly inherited and usable from subtypes, in both remote and embedded modes.
+
+### Changed
+
+- **Vector search scores** — `vector_query()` now returns real differentiated cosine similarity scores per entity type by searching each concrete subtype individually (e.g. `vectorNeighbors('PERSON[embedding]', q) FROM PERSON`). Previously all results could share a uniform score; now the merged top-k reflects actual semantic relevance, improving graph retrieval ranking in downstream consumers such as flexible-graphrag.
+- **Entity inheritance model** — entity subtypes (`PERSON`, `ORGANIZATION`, `LOCATION`, `PLACE`, and dynamically created types) now extend a common `Entity` base vertex type. The `UNIQUE(name)` index is created per subtype; the `LSM_VECTOR(embedding)` index is created once on `Entity` and inherited by all subtypes. `TextChunk` remains separate from this hierarchy with its own `UNIQUE(id)` and `LSM_VECTOR(embedding)` indexes.
+- **`DuplicatedKeyException` handling** — concurrent upserts of the same entity name no longer log spurious warnings; a fallback `UPDATE ... WHERE name = ?` is issued automatically and duplicate-key exceptions in the bulk upsert path are demoted to DEBUG.
+- **Java logging suppression** (`_db_adapter.py`) — a JUL `Filter` (via `JProxy`) is installed on the root handler at startup to block all `com.arcadedb.index.*` log records. This covers `LSMVectorIndexPageParser` "Invalid position" / "FALLBACK" warnings across all threads including embedded server worker threads. `_suppress_page_parser_once()` additionally silences any newly registered index loggers on the first vector search.
+- **Python driver logging suppression** — `arcadedb_python.api.sync` logger (which logs every non-2xx HTTP response at ERROR) is suppressed to CRITICAL around remote vector searches and remote index creation.
+
+### Fixed
+
+- `TextChunk.embedding` property now explicitly created before the `LSM_VECTOR` index is applied, preventing schema errors on fresh databases.
+- `_cache_existing_vector_index` no longer emits a WARNING when the Java schema API cannot find a subtype index by name (expected behaviour when the index lives on the `Entity` base); demoted to DEBUG.
+
+### Dependencies
+
+- Package version `0.4.1` → `0.4.2`
+- Tested with Python 3.13 and 3.14, `arcadedb-python>=0.4.0`, optional `arcadedb-embedded>=26.3.2`
+
+---
+
 ## [2026-03-07] - 0.4.1 Release: embedded ArcadeDB in-process mode
 
 ### Added

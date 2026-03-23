@@ -26,7 +26,7 @@ dev = [
 
 [project]
 name = "llama-index-graph-stores-arcadedb"
-version = "0.4.1"
+version = "0.4.2"
 description = "LlamaIndex Graph Stores integration for ArcadeDB - Multi-Model Database with Graph, Document, Key-Value, Vector, and Time-Series support"
 authors = [
     {name = "Steve Reiner"},
@@ -74,7 +74,7 @@ dependencies = [
     # Required only when using mode="embedded" in ArcadeDBPropertyGraphStore.
     # Uncomment to include, or install separately:
     #   uv pip install arcadedb-embedded
-    # "arcadedb-embedded>=26.2.1",
+    # "arcadedb-embedded>=26.3.2",
 ]
 
 [project.optional-dependencies]
@@ -110,11 +110,11 @@ skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb"
 
 [tool.hatch.build.targets.sdist]
 include = ["llama_index/"]
-exclude = ["**/BUILD"]
+exclude = ["**/BUILD", "venv-3.13/", "venv-3.14/", "venv-3.12/", "venv/", ".venv/"]
 
 [tool.hatch.build.targets.wheel]
 include = ["llama_index/"]
-exclude = ["**/BUILD"]
+exclude = ["**/BUILD", "venv-3.13/", "venv-3.14/", "venv-3.12/", "venv/", ".venv/"]
 
 [tool.llamahub]
 contains_example = false

@@ -279,6 +279,32 @@ class EmbeddedAdapter:
         self._server: Optional[Any] = server
         # Cache of {"type_name:embedding_field": VectorIndex}
         self._vector_indexes: Dict[str, Any] = {}
+        # Deferred: suppress LSMVectorIndexPageParser on first search (logger
+        # may not be registered in JUL until the first page parse fires).
+        self._page_parser_suppressed: bool = False
+
+    def _suppress_page_parser_once(self) -> None:
+        """One-shot: silence any com.arcadedb.index.* JUL loggers now registered.
+
+        The Filter installed by _suppress_java_info_logging() handles the actual
+        blocking, but setting individual logger levels to SEVERE reduces overhead
+        by stopping records before they reach the handler at all.
+        """
+        if self._page_parser_suppressed:
+            return
+        self._page_parser_suppressed = True
+        try:
+            from jpype import JClass
+            Level = JClass("java.util.logging.Level")
+            mgr = JClass("java.util.logging.LogManager").getLogManager()
+            for name in list(mgr.getLoggerNames()):
+                name_str = str(name)
+                if name_str.startswith("com.arcadedb.index"):
+                    log = mgr.getLogger(name)
+                    if log is not None:
+                        log.setLevel(Level.SEVERE)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Embedded server accessors
@@ -379,6 +405,7 @@ class EmbeddedAdapter:
         ``build_graph_now()``, then calls ``find_nearest()``.
         """
         cache_key = f"{type_name}:{embedding_field}"
+        self._suppress_page_parser_once()
 
         if self.is_server_mode:
             return self._vector_search_sql(type_name, embedding_field, query_embedding, top_k)
@@ -427,15 +454,16 @@ class EmbeddedAdapter:
     ) -> List[Dict[str, Any]]:
         """SQL-based vector search for embedded server mode.
 
-        Uses the ArcadeDB embedded Python bindings' documented pattern
-        (https://docs.humem.ai/arcadedb/latest/examples/03_vector_search/):
+        Uses the ArcadeDB Results API pattern
+        (https://docs.humem.ai/arcadedb/latest/api/results/):
 
             result_set = db.query("sql",
-                "SELECT vectorNeighbors('TypeName[prop]', <vec>, k) as res")
-            rows = result_set.to_list()   # → [{"res": [{"record": <JavaVertex>, "distance": float}, ...]}]
-            for hit in rows[0]["res"]:
-                vertex_java = hit["record"]   # raw Java Vertex object
-                distance    = hit["distance"] # float
+                "SELECT vectorNeighbors('TypeName[prop]', <vec>, k) as res FROM Type LIMIT 1")
+            for row in result_set:           # iterate ResultSet → Result objects
+                neighbors = row.get("res")  # → [{"record": <JavaVertex>, "distance": float}, ...]
+                for hit in neighbors:
+                    vertex_java = hit["record"]
+                    distance    = hit["distance"]
 
         ``convert_java_to_python`` converts JavaList/JavaMap recursively but
         leaves Java Vertex objects as-is (no Python case for them).  We wrap
@@ -448,37 +476,33 @@ class EmbeddedAdapter:
         """
         from arcadedb_embedded.graph import Document as ArcadeDocument
 
+        # ArcadeDB resolves the inherited index by the subtype name — e.g.
+        # vectorNeighbors('PERSON[embedding]', q) FROM PERSON finds rows even
+        # when the LSM_VECTOR index is declared only on the Entity base type.
         index_name = f"{type_name}[{embedding_field}]"
         vec_literal = "[" + ", ".join(str(float(x)) for x in query_embedding) + "]"
-        sql = f"SELECT vectorNeighbors('{index_name}', {vec_literal}, {top_k}) as res"
+        sql = (
+            f"SELECT vectorNeighbors('{index_name}', {vec_literal}, {top_k}) as res"
+            f" FROM {type_name} LIMIT 1"
+        )
         logger.debug(
             "EmbeddedAdapter._vector_search_sql: querying index %s top_k=%d",
-            index_name,
-            top_k,
+            index_name, top_k,
         )
         try:
-            # db.query() returns a ResultSet; .to_list() calls result.to_dict()
-            # on each Result row, which runs convert_java_to_python on each value.
-            # For the "res" list, convert_java_to_python converts JavaList→list and
-            # JavaMap→dict recursively, but leaves the Java Vertex "record" as-is.
             result_set = self._db.query("sql", sql)
             if result_set is None:
-                logger.debug(
-                    "EmbeddedAdapter._vector_search_sql: %s — result_set is None",
-                    index_name,
-                )
                 return []
 
-            rows = result_set.to_list()   # List[Dict]  (1 row with "res" key)
-            if not rows:
-                logger.debug(
-                    "EmbeddedAdapter._vector_search_sql: %s — no rows returned",
-                    index_name,
-                )
+            # Use the Results API: iterate ResultSet, call result.get() on each Result.
+            first_result = None
+            for row in result_set:
+                first_result = row
+                break  # vectorNeighbors returns one row containing all neighbors
+            if first_result is None:
                 return []
 
-            neighbors = rows[0].get("res") or []
-            # Coerce Java collection to Python list if needed
+            neighbors = first_result.get("res") or []
             if not isinstance(neighbors, list):
                 try:
                     neighbors = list(neighbors)
@@ -487,8 +511,7 @@ class EmbeddedAdapter:
 
             logger.debug(
                 "EmbeddedAdapter._vector_search_sql: %s returned %d neighbors",
-                index_name,
-                len(neighbors),
+                index_name, len(neighbors),
             )
 
             result: List[Dict[str, Any]] = []
@@ -501,16 +524,10 @@ class EmbeddedAdapter:
                     continue
                 java_vertex = hit.get("record")
                 distance = hit.get("distance", 1.0)
-
                 if java_vertex is None:
                     continue
-
-                # Wrap the raw Java Vertex in the Python bindings wrapper, then
-                # convert to a plain dict using the bindings' own to_dict().
                 try:
                     wrapped = ArcadeDocument.wrap(java_vertex)
-                    # wrapped.to_dict() and get_type_name()/get_rid() return Java String
-                    # objects — coerce everything to Python str so Pydantic validation passes.
                     flat = {str(k): v for k, v in wrapped.to_dict().items()}
                     flat["@rid"] = str(wrapped.get_rid())
                     flat["@type"] = str(wrapped.get_type_name())
@@ -521,7 +538,6 @@ class EmbeddedAdapter:
                         wrap_exc, traceback.format_exc(),
                     )
                     continue
-
                 flat["distance"] = float(distance) if distance is not None else 1.0
                 result.append(flat)
 
@@ -530,8 +546,7 @@ class EmbeddedAdapter:
         except Exception as exc:
             logger.debug(
                 "EmbeddedAdapter._vector_search_sql failed for %s: %s",
-                type_name,
-                exc,
+                type_name, exc,
             )
             return []
 
@@ -657,7 +672,27 @@ class EmbeddedAdapter:
                 self._vector_indexes[cache_key].get_size(),
             )
         except Exception as exc:
-            logger.warning(
+            # The Java schema API does not resolve inherited index names — it only
+            # knows "Entity[embedding]", not "PERSON[embedding]".  Fall back to the
+            # base index when the subtype lookup fails.
+            if type_name != "Entity":
+                try:
+                    schema = self._db._java_db.getSchema()
+                    idx = schema.getIndexByName(f"Entity[{embedding_field}]")
+                    from arcadedb_embedded.vector import VectorIndex
+                    self._vector_indexes[cache_key] = VectorIndex(idx, self._db)
+                    logger.debug(
+                        "EmbeddedAdapter: using inherited Entity[%s] index for subtype %s",
+                        embedding_field, type_name,
+                    )
+                    return
+                except Exception:
+                    pass
+            # The Java schema API doesn't resolve inherited indexes by subtype name
+            # (e.g. "PERSON[embedding]" fails when only "Entity[embedding]" exists).
+            # If the Entity fallback above also failed, log at DEBUG — not WARNING —
+            # because the caller will simply skip this type and the search continues.
+            logger.debug(
                 "EmbeddedAdapter: could not retrieve existing vector index %s: %s",
                 cache_key,
                 exc,
@@ -692,27 +727,58 @@ class EmbeddedAdapter:
 # ---------------------------------------------------------------------------
 
 def _suppress_java_info_logging() -> None:
-    """Set the java.util.logging root logger to WARNING.
+    """Set the java.util.logging root logger to WARNING and install a Filter
+    that blocks known-benign ArcadeDB vector-index noise on all handlers.
 
-    ArcadeDB (and JVector) emit many INFO-level messages to stdout when
-    rebuilding vector-index graphs (``LSMVectorIndex``, ``LSMVectorIndexGraphFile``
-    etc.).  These go through java.util.logging — Python's ``logging`` module
-    cannot suppress them.  Raising the JUL root level to WARNING silences the
-    chatter while still surfacing genuine problems.
+    ArcadeDB emits many INFO/WARNING messages through java.util.logging (JUL)
+    during normal vector-index operations.  Python's ``logging`` module cannot
+    intercept these.
 
-    This is a no-op if the JVM has not been started yet (the call site in
-    ``build_embedded_adapter`` is always after JVM startup), and it is safe
-    to call multiple times.
+    Two layers of suppression are applied:
+
+    1. Root + ``com.arcadedb`` logger levels set to WARNING (blocks INFO).
+    2. A ``Filter`` installed on every root handler that drops records whose
+       logger name matches ``com.arcadedb.index`` — this catches WARNING-level
+       messages like "Error parsing page / Invalid position" from
+       ``LSMVectorIndexPageParser`` regardless of which thread fires them and
+       regardless of when the logger was first registered.
+
+    This is a no-op if the JVM has not been started yet, and safe to call
+    multiple times (the filter is only added once per handler).
     """
     try:
-        from jpype import JClass
+        from jpype import JClass, JProxy
+
         Level = JClass("java.util.logging.Level")
         LogManager = JClass("java.util.logging.LogManager")
         mgr = LogManager.getLogManager()
-        mgr.getLogger("").setLevel(Level.WARNING)
+        root = mgr.getLogger("")
+        root.setLevel(Level.WARNING)
         arcade_log = mgr.getLogger("com.arcadedb")
         if arcade_log is not None:
             arcade_log.setLevel(Level.WARNING)
+
+        # Build a JUL Filter that drops all com.arcadedb.index.* records.
+        # Using JProxy to implement the single-method Filter interface.
+        def _reject_arcade_index(record) -> bool:
+            name = str(record.getLoggerName())
+            return not name.startswith("com.arcadedb.index")
+
+        Filter = JClass("java.util.logging.Filter")
+        proxy_filter = JProxy(Filter, dict={"isLoggable": _reject_arcade_index})
+
+        # Install on every handler attached to the root logger.
+        for handler in root.getHandlers():
+            existing = handler.getFilter()
+            # Avoid double-installing (no reliable equality check on JProxy,
+            # so we store a marker attribute on the Python side).
+            if not getattr(handler, "_arcade_index_filter_installed", False):
+                handler.setFilter(proxy_filter)
+                try:
+                    handler._arcade_index_filter_installed = True
+                except Exception:
+                    pass
+
     except Exception:
         pass  # Best-effort; never break the caller
 

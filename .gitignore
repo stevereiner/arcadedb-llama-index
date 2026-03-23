@@ -172,3 +172,5 @@ Thumbs.db
 
 # Windows
 *.lnk
+
+venv-3.13/

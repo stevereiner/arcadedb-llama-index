@@ -13,7 +13,7 @@ llama-index-llms-openai
 # Includes bundled Java 25 JRE (~60MB) + ArcadeDB JARs (~32MB) + Python bindings
 # Only needed when using mode="embedded" in ArcadeDBPropertyGraphStore
 # Install with: uv pip install arcadedb-embedded
-# arcadedb-embedded>=26.2.1
+# arcadedb-embedded>=26.3.2
 
 # Development dependencies (install with: uv pip install -e ".[dev]")
 # black>=23.0.0
