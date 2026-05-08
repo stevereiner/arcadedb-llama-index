@@ -507,6 +507,11 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         Returns:
             True if type was created or already exists, False if creation failed
         """
+        # Guard against empty or None type names (would produce invalid SQL)
+        if not type_name or not type_name.strip():
+            logger.warning("_ensure_dynamic_type: skipping %s with empty type_name", type_kind)
+            return False
+
         # Check if we've already discovered this type
         if type_kind == 'VERTEX' and type_name in self._discovered_vertex_types:
             logger.debug(f"Type {type_name} already discovered as {type_kind}")
@@ -2259,7 +2264,12 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
         
         logger.debug(f"SQL_RELATION: source '{relation.source_id}' -> normalized '{normalized_source_id}'")
         logger.debug(f"SQL_RELATION: target '{relation.target_id}' -> normalized '{normalized_target_id}'")
-        
+
+        # Skip relations with empty/None labels — they produce invalid SQL
+        if not relation.label or not str(relation.label).strip():
+            logger.warning("SQL_RELATION: skipping relation with empty label (source=%s, target=%s)", relation.source_id, relation.target_id)
+            return
+
         # Create edge type if it doesn't exist (dynamic schema)
         self._ensure_dynamic_type(relation.label, 'EDGE')
         

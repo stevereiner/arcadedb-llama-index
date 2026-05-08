@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-05-04] - 0.4.3 Release: Guard against empty/None type names and relation labels
+
+### Fixed
+
+- **`arcadedb_property_graph.py` — `_ensure_dynamic_type`**: added an early-return guard when `type_name` is `None` or blank. Without this, an empty string was interpolated directly into the DDL, producing malformed SQL such as `CREATE EDGE TYPE  IF NOT EXISTS`, which raises a `SemanticError` in ArcadeDB. Empty names are now logged at WARNING and the method returns `False` immediately.
+- **`arcadedb_property_graph.py` — `_add_relation`**: added a guard before edge-type creation and edge insertion when `relation.label` is `None` or blank. Relations with an empty label are logged at WARNING and the method returns early; the `_ensure_dynamic_type` call and subsequent INSERT that follow are never reached.
+
+### Changed
+
+- `pyproject.toml` version `0.4.2` → `0.4.3`
+
+---
+
 ## [2026-03-22] - 0.4.2 Release: Entity base-type inheritance, real vector search scores, TextChunk vector index, logging suppression
 
 ### Added
