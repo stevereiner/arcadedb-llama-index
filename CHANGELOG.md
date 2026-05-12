@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-05-11] - 0.4.4 Release: Cypher query routing and vertex/edge label collision guard
+
+### Fixed
+
+- **`arcadedb_property_graph.py` — `structured_query()`: OpenCypher detection**: the method previously routed all queries through ArcadeDB's SQL engine, causing `SQL syntax error` failures when LlamaIndex issued OpenCypher queries (`MATCH`, `MERGE`, `OPTIONAL MATCH`, `CREATE (`, `WITH`, `CALL`) during graph traversal and retrieval. The method now detects these keywords and routes them to ArcadeDB's OpenCypher engine (`self._db.query("opencypher", query)`), while all other queries (DDL/DML) continue through the SQL engine with `is_command=True` where appropriate.
+
+- **`arcadedb_property_graph.py` — `upsert_relations()`: vertex/edge label collision guard**: ArcadeDB shares a single namespace for vertex types and edge types. When the LLM extracts a label used for both a node type and a relation type (e.g. `DATE`), creating an edge of that type raised `"Type 'DATE' is not an Edge type"`. `upsert_relations()` now checks each relation label against `self._discovered_vertex_types` before upserting; any colliding label has `_REL` appended (e.g. `DATE` → `DATE_REL`), matching the equivalent fix already present in the LangChain ArcadeDB adapter.
+
+### Changed
+
+- `pyproject.toml` version `0.4.3` → `0.4.4`
+
+---
+
 ## [2026-05-04] - 0.4.3 Release: Guard against empty/None type names and relation labels
 
 ### Fixed

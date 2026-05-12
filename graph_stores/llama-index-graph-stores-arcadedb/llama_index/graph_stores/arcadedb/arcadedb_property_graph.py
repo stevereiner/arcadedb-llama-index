@@ -1572,7 +1572,16 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def upsert_relations(self, relations: List[Relation]) -> None:
         """Insert or update relationships in the graph using v0.4.0+ bulk operations."""
         logger.info(f"RELATIONS: Upserting {len(relations)} relations")
-        
+
+        # ArcadeDB shares one namespace for vertex types AND edge types.
+        # If the LLM extracts the same label as both a node type and a relation type
+        # (e.g. DATE), creating an edge of that type fails with
+        # "Type 'DATE' is not an Edge type".  Rename colliding relation labels.
+        if self._discovered_vertex_types:
+            for relation in relations:
+                if relation.label in self._discovered_vertex_types:
+                    relation.label = relation.label + "_REL"
+
         # Try bulk operations first for better performance
         try:
             # Group relations by type for bulk operations
@@ -1719,16 +1728,25 @@ class ArcadeDBPropertyGraphStore(PropertyGraphStore):
     def structured_query(
         self, query: str, param_map: Optional[Dict[str, Any]] = None
     ) -> Any:
-        """Execute a structured SQL query against the graph.
-        
-        This SQL-only version provides optimal performance for ArcadeDB operations.
+        """Execute a structured query against the graph.
+
+        Automatically detects the query language:
+        - Cypher (MATCH / MERGE / CREATE pattern): routed to ArcadeDB's Cypher engine
+        - SQL (everything else): routed to ArcadeDB's SQL engine
+
         DML statements (DELETE, INSERT, UPDATE, CREATE, DROP, TRUNCATE) are
         automatically sent as commands (is_command=True) to satisfy ArcadeDB's
         non-idempotent query requirement.
         """
         try:
-            # Detect DML/DDL statements that require is_command=True
             query_upper = query.strip().upper()
+            # Detect OpenCypher keywords — ArcadeDB uses "opencypher" engine name
+            is_cypher = query_upper.startswith(('MATCH ', 'MERGE ', 'OPTIONAL MATCH ',
+                                                'CREATE (', 'WITH ', 'CALL '))
+            if is_cypher:
+                results = self._db.query("opencypher", query)
+                return results
+            # SQL path: detect DML/DDL statements that require is_command=True
             is_command = query_upper.startswith((
                 'DELETE', 'INSERT', 'UPDATE', 'CREATE', 'DROP', 'TRUNCATE', 'ALTER'
             ))
